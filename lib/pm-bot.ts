@@ -332,6 +332,7 @@ export async function getPMConfig(): Promise<PMBotConfig> {
     .map((ev) => ({
       symbol: ev.symbol || 'CRYPTO/USDT',
       marketKey: ev.marketKey,
+      tokenId: typeof ev.tokenId === 'string' ? ev.tokenId : undefined,
       label: ev.label || ev.marketKey,
       timeframeMinutes: Number(ev.timeframeMinutes || 60),
       enabled: Boolean(ev.enabled),
@@ -362,6 +363,7 @@ export async function updatePMConfig(next: Partial<PMBotConfig>): Promise<PMBotC
     .map((ev) => ({
       symbol: ev.symbol || 'CRYPTO/USDT',
       marketKey: ev.marketKey,
+      tokenId: typeof ev.tokenId === 'string' ? ev.tokenId : undefined,
       label: ev.label || ev.marketKey,
       timeframeMinutes: Number(ev.timeframeMinutes || 60),
       enabled: Boolean(ev.enabled),
@@ -548,6 +550,15 @@ export async function runPMCycle(): Promise<void> {
   const stats = getStats(nextBets);
   let mutable = [...nextBets];
   let decisionBuffer = [...decisions];
+  const liveGuard = await evaluateLiveGuards(config, feed);
+  const executionStatus: PMRuntimeState['executionStatus'] = config.mode === 'live' ? (liveGuard.allowed ? 'LIVE' : 'BLOCKED') : 'PAPER';
+  const effectiveMode: PMExecutionMode = executionStatus === 'LIVE' ? 'live' : 'paper';
+  const tokenMap = parseTokenMapFromEnv();
+  const liveBetSizeUsd = clamp(config.paperBetSizeUsd, PM_LIVE_MIN_BET_USD, PM_LIVE_MAX_BET_USD);
+  const activeLiveCount = mutable.filter((b) => b.status === 'open' && b.execution === 'live').length;
+  let liveSlotsLeft = Math.max(0, PM_LIVE_MAX_CONCURRENT_ORDERS - activeLiveCount);
+  let clobClient: ClobClient | null = null;
+  let authBroken = false;
 
   if (config.enabled && stats.todayPnlUsd > -Math.abs(config.maxDailyLossUsd)) {
     for (const ev of config.events) {
@@ -562,15 +573,15 @@ export async function runPMCycle(): Promise<void> {
 
       const decision = buildDecision(ev.symbol, ev.marketKey, sig, price);
       decisionBuffer = [decision, ...decisionBuffer].slice(0, MAX_DECISIONS);
-
       if (decision.confidence < config.confidenceThreshold) continue;
 
       const edge = clamp((decision.confidence - 50) / 100, 0.02, 0.35);
       const entryOdds = Number(clamp(0.5 - edge, 0.12, 0.88).toFixed(3));
       const openedAt = new Date().toISOString();
       const settleAt = new Date(Date.now() + ev.timeframeMinutes * 60_000).toISOString();
+      const tokenId = resolveTokenId(ev, tokenMap);
 
-      mutable.unshift({
+      const baseBet: PMPaperBet = {
         id: `pm-paper-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
         marketKey: ev.marketKey,
         pair: ev.symbol,
@@ -584,7 +595,70 @@ export async function runPMCycle(): Promise<void> {
         openedAt,
         settleAt,
         status: 'open',
-      });
+        execution: 'paper',
+      };
+
+      const canAttemptLive = effectiveMode === 'live' && executionStatus === 'LIVE' && !authBroken && liveSlotsLeft > 0 && Boolean(tokenId);
+      if (!canAttemptLive) {
+        if (effectiveMode === 'live' && !tokenId) {
+          baseBet.fallbackReason = 'LIVE requested but tokenId missing; set PM_MARKET_TOKEN_MAP or event.tokenId';
+          await appendLiveOrderLog(`[FALLBACK:PAPER] market=${ev.marketKey} reason=${baseBet.fallbackReason}`);
+        }
+        mutable.unshift(baseBet);
+        continue;
+      }
+
+      try {
+        if (!clobClient) clobClient = await createPMClobClient();
+        const liveResult = await tryPlaceLiveOrder({
+          client: clobClient,
+          event: ev,
+          decision,
+          tokenId: tokenId!,
+          sizeUsd: liveBetSizeUsd,
+          entryPrice: Number(price.toFixed(8)),
+          entryOdds,
+          settleAt,
+        });
+
+        if (liveResult.ok) {
+          liveSlotsLeft -= 1;
+          const liveBet: PMPaperBet = {
+            ...baseBet,
+            id: `pm-live-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+            sizeUsd: liveBetSizeUsd,
+            execution: 'live',
+            liveOrderId: liveResult.orderId,
+            liveOrderStatus: liveResult.status,
+            liveTokenId: tokenId!,
+            reason: `${baseBet.reason} | liveOrder=${liveResult.orderId}`,
+          };
+          console.log(`[pm-live-order] POSTED market=${ev.marketKey} token=${tokenId} side=${decision.side} size=${liveBetSizeUsd} orderId=${liveResult.orderId}`);
+          await appendLiveOrderLog(`[POSTED] market=${ev.marketKey} token=${tokenId} side=${decision.side} sizeUsd=${liveBetSizeUsd} orderId=${liveResult.orderId}`);
+          mutable.unshift(liveBet);
+          continue;
+        }
+
+        if (liveResult.authOrSignature) {
+          authBroken = true;
+          console.error(`[pm-live-order][AUTH/SIGNATURE] ${liveResult.error}`);
+          await appendLiveOrderLog(`[ALERT_AUTH_SIGNATURE] market=${ev.marketKey} token=${tokenId} error=${liveResult.error}`);
+        } else {
+          console.error(`[pm-live-order][FAIL] market=${ev.marketKey} token=${tokenId} error=${liveResult.error}`);
+          await appendLiveOrderLog(`[FAIL] market=${ev.marketKey} token=${tokenId} error=${liveResult.error}`);
+        }
+
+        baseBet.fallbackReason = `live order failed: ${liveResult.error}`;
+        mutable.unshift(baseBet);
+      } catch (error: any) {
+        const msg = error?.message || String(error);
+        const authErr = isAuthOrSignatureError(msg);
+        if (authErr) authBroken = true;
+        console.error(`[pm-live-order][EXCEPTION] market=${ev.marketKey} token=${tokenId} error=${msg}`);
+        await appendLiveOrderLog(`[EXCEPTION] market=${ev.marketKey} token=${tokenId} authOrSignature=${authErr} error=${msg}`);
+        baseBet.fallbackReason = `live exception: ${msg}`;
+        mutable.unshift(baseBet);
+      }
     }
   }
 
@@ -599,6 +673,7 @@ export async function getPMRuntimeState(): Promise<PMRuntimeState> {
   const now = Date.now();
   const [config, feed, bets] = await Promise.all([getPMConfig(), readBybitFeed(), getPMBets()]);
   const decisions = await getPMDecisions();
+  const tokenMap = parseTokenMapFromEnv();
   const stats = getStats(bets);
   const serverTimestamp = new Date(now).toISOString();
   const feedTs = feed?.timestamp ? new Date(feed.timestamp).getTime() : NaN;
@@ -638,6 +713,7 @@ export async function getPMRuntimeState(): Promise<PMRuntimeState> {
       return {
         symbol: ev.symbol,
         marketKey: ev.marketKey,
+        tokenId: ev.tokenId || tokenMap[ev.marketKey] || null,
         label: ev.label,
         enabled: ev.enabled,
         suggestedSide: latestDecision?.side || 'NONE',
