@@ -1,0 +1,35 @@
+{
+    "stochRsi":  {
+                     "rsiPeriod":  5,
+                     "stochPeriod":  5,
+                     "kSmoothing":  3,
+                     "dSmoothing":  3
+                 },
+    "entryZones":  {
+                       "oversoldThreshold":  30,
+                       "oversoldExitMax":  55,
+                       "overboughtThreshold":  70,
+                       "overboughtExitMin":  45
+                   },
+    "ema":  {
+                "fast":  9,
+                "slow":  21,
+                "trend":  50
+            },
+    "atr":  {
+                "period":  10
+            },
+    "volume":  {
+                   "smaPeriod":  20,
+                   "spikeThreshold":  1
+               },
+    "risk":  {
+                 "slAtrMultiple":  1.5,
+                 "tpAtrMultiple":  2.25,
+                 "minSlPercent":  0.3,
+                 "roundtripFeePct":  0.11,
+                 "timeStopCandles":  10,
+                 "minTpFeeMultiple":  2.5
+             },
+    "_updated":  "2026-03-11T07:25:10.478Z"
+}

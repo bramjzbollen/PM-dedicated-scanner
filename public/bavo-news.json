@@ -1,0 +1,74 @@
+{
+  "items": [
+    {
+      "id": "iran-war-f1-2026",
+      "title": "Oorlog in Midden-Oosten overschaduwt F1-seizoen dat vandaag start",
+      "source": "De Tijd",
+      "url": "https://www.tijd.be/ondernemen/sport/oorlog-in-midden-oosten-overschaduwt-f1-seizoen-dat-start-met-resetknop/10651332.html",
+      "topic": "f1",
+      "lang": "nl",
+      "publishedAt": "2026-03-07T05:00:00Z",
+      "breaking": true
+    },
+    {
+      "id": "bitcoin-crash-30pct-2026",
+      "title": "Bitcoin kan nog eens 30% crashen volgens investeringsfirma - vier-jarige cyclus wordt sterker",
+      "source": "CoinDesk",
+      "url": "https://www.coindesk.com/markets/2026/03/07/bitcoin-could-crash-another-30-as-four-year-cycle-gains-strength-investment-firm-says",
+      "topic": "crypto",
+      "lang": "nl",
+      "publishedAt": "2026-03-07T05:44:00Z",
+      "breaking": false
+    },
+    {
+      "id": "loop-earplugs-50m-funding",
+      "title": "Antwerpse Loop Earplugs scoort €50 miljoen voor wereldverovering",
+      "source": "De Tijd",
+      "url": "https://www.tijd.be/ondernemen/consumentengoederen/loop-earplugs-tankt-50-miljoen-voor-volgende-groeifase/10651518.html",
+      "topic": "tech",
+      "lang": "nl",
+      "publishedAt": "2026-03-07T00:05:00Z",
+      "breaking": false
+    },
+    {
+      "id": "blackrock-credit-crisis-crypto",
+      "title": "BlackRock's private credit fonds kraakt - crypto en DeFi markten onder druk",
+      "source": "CoinDesk",
+      "url": "https://www.coindesk.com/markets/2026/03/06/blackrock-private-credit-fund-is-latest-to-crack-hitting-crypto-prices-and-defi-markets",
+      "topic": "business",
+      "lang": "nl",
+      "publishedAt": "2026-03-06T17:30:00Z",
+      "breaking": false
+    },
+    {
+      "id": "tusk-chips-eu-starlink",
+      "title": "Vlaamse chipmaker Tusk bouwt chips voor 'Europese Starlink' - Musk krijgt concurrentie",
+      "source": "De Tijd",
+      "url": "https://www.tijd.be/video/1009.html",
+      "topic": "tech",
+      "lang": "nl",
+      "publishedAt": "2026-03-06T12:00:00Z",
+      "breaking": false
+    },
+    {
+      "id": "us-jobs-crash-bitcoin-down",
+      "title": "VS verliest onverwacht 92.000 banen - werkloosheid stijgt naar 4,4%, Bitcoin zakt verder",
+      "source": "CoinDesk",
+      "url": "https://www.coindesk.com/markets/2026/03/06/u-s-lost-92-000-jobs-in-february-unemployment-rate-rose-to-4-2",
+      "topic": "business",
+      "lang": "nl",
+      "publishedAt": "2026-03-06T13:33:00Z",
+      "breaking": false
+    },
+    {
+      "id": "kazakhstan-350m-crypto-investment",
+      "title": "Kazachstan investeert $350 miljoen staatsreserves in crypto en digitale assets",
+      "source": "CoinDesk",
+      "url": "https://www.coindesk.com/business/2026/03/06/kazakhstan-central-bank-to-invest-usd350-million-worth-of-gold-forex-reserves-into-digital-assets",
+      "topic": "crypto",
+      "lang": "nl",
+      "publishedAt": "2026-03-06T13:08:00Z",
+      "breaking": false
+    }
+  ]
+}

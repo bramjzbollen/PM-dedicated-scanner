@@ -1,0 +1,26 @@
+{
+  "_generated": "2026-03-12T18:46:37.168Z",
+  "_cycle": 479,
+  "1m": {
+    "rsiOversoldShift": 0,
+    "rsiOverboughtShift": 0,
+    "volumeMultiplierShift": 0,
+    "atrMinShift": 0,
+    "bodyRatioShift": 0,
+    "confidenceBoostBias": 0,
+    "confidenceBoostVolume": 0,
+    "confidenceBoostEntry": 0,
+    "minScoreShift": 0
+  },
+  "15m": {
+    "rsiOversoldShift": 0,
+    "rsiOverboughtShift": 0,
+    "volumeMultiplierShift": 0,
+    "atrMinShift": 0,
+    "bodyRatioShift": 0,
+    "confidenceBoostBias": 0,
+    "confidenceBoostVolume": 0,
+    "confidenceBoostEntry": 0,
+    "minScoreShift": 0
+  }
+}

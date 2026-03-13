@@ -1,0 +1,146 @@
+import { NextRequest, NextResponse } from 'next/server';
+import {
+  loadState, saveState, closePosition, resetState,
+  updatePricesAndCheckExits, processSignals, createPosition,
+  type TradeState,
+} from '@/lib/server-trade-state';
+
+export const dynamic = 'force-dynamic';
+
+// GET: Return current state for a mode
+export async function GET(request: NextRequest) {
+  const mode = request.nextUrl.searchParams.get('mode') || 'v2-scalping';
+  try {
+    const state = await loadState(mode);
+
+    // Calculate derived values
+    const openPnl = state.positions.reduce((sum, p) => sum + p.pnl, 0);
+    const totalPnl = state.stats.realizedPnl + openPnl;
+    const winRate = state.stats.closedCount > 0 ? (state.stats.winCount / state.stats.closedCount) * 100 : 0;
+    const avgDuration = state.stats.closedCount > 0 ? state.stats.totalDurationMs / state.stats.closedCount : 0;
+
+    const positionSize = state.config.positionSize || 100;
+    const effectiveMax = positionSize > 0
+      ? Math.min(Math.max(Math.floor(state.stats.walletBalance / positionSize), 2), Math.min(state.config.maxPositions, 20))
+      : state.config.maxPositions;
+
+    return NextResponse.json({
+      ...state,
+      openPnl,
+      totalPnl,
+      winRate,
+      avgDuration,
+      effectiveMaxPositions: effectiveMax,
+    }, {
+      headers: { 'Cache-Control': 'no-store' },
+    });
+  } catch (error) {
+    return NextResponse.json({ error: 'Failed to load state' }, { status: 500 });
+  }
+}
+
+// POST: Execute an action
+export async function POST(request: NextRequest) {
+  try {
+    const body = await request.json();
+    const { mode, action, ...params } = body;
+
+    if (!mode || !action) {
+      return NextResponse.json({ error: 'mode and action required' }, { status: 400 });
+    }
+
+    let state = await loadState(mode);
+
+    switch (action) {
+      case 'start':
+        state.isRunning = true;
+        break;
+
+      case 'stop':
+        state.isRunning = false;
+        break;
+
+      case 'updateConfig':
+        state.config = { ...state.config, ...params.config };
+        break;
+
+      case 'updateWalletSize':
+        state.initialWalletSize = params.walletSize || 1000;
+        break;
+
+      case 'reset':
+        state = resetState(state);
+        break;
+
+      case 'closePosition':
+        if (params.positionId) {
+          const pos = state.positions.find(p => p.id === params.positionId);
+          if (pos) {
+            state = closePosition(state, params.positionId, 'manual', pos.currentPrice);
+          }
+        }
+        break;
+
+      case 'closeAll':
+        for (const pos of [...state.positions]) {
+          state = closePosition(state, pos.id, 'manual', pos.currentPrice);
+        }
+        break;
+
+      case 'manualEntry':
+        if (params.symbol && params.direction && params.price > 0) {
+          const effectiveMax = state.config.positionSize > 0
+            ? Math.min(Math.max(Math.floor(state.stats.walletBalance / state.config.positionSize), 2), Math.min(state.config.maxPositions, 20))
+            : state.config.maxPositions;
+
+          if (state.positions.length < effectiveMax && !state.positions.some(p => p.symbol === params.symbol)) {
+            const pos = createPosition(state, params.symbol, params.direction, params.price, params.trade);
+            state.positions = [...state.positions, pos];
+            state.stats = { ...state.stats, totalTrades: state.stats.totalTrades + 1 };
+          }
+        }
+        break;
+
+      case 'manualEntryFromQueue':
+        if (params.queueItemId) {
+          const qi = state.queue.find(q => q.id === params.queueItemId);
+          if (qi) {
+            const pos = createPosition(state, qi.symbol, qi.direction, params.price || qi.price);
+            if (!state.positions.some(p => p.symbol === qi.symbol)) {
+              state.positions = [...state.positions, pos];
+              state.stats = { ...state.stats, totalTrades: state.stats.totalTrades + 1 };
+              state.queue = state.queue.filter(q => q.id !== params.queueItemId);
+            }
+          }
+        }
+        break;
+
+      case 'updatePrices':
+        if (params.prices) {
+          state = updatePricesAndCheckExits(state, params.prices);
+        }
+        break;
+
+      case 'processSignals':
+        if (params.signals && params.prices) {
+          state = updatePricesAndCheckExits(state, params.prices);
+          state = processSignals(state, params.signals, params.prices, params.cooldownMs || 0);
+        }
+        break;
+
+      default:
+        return NextResponse.json({ error: `Unknown action: ${action}` }, { status: 400 });
+    }
+
+    state.lastUpdate = new Date().toISOString();
+    
+    // User-initiated actions always save (bypass accidental-reset protection)
+    const isExplicitAction = ['reset', 'start', 'stop', 'closePosition', 'closeAll', 'manualEntry', 'manualEntryFromQueue', 'updateConfig', 'updateWalletSize'].includes(action);
+    await saveState(state, isExplicitAction);
+
+    return NextResponse.json({ success: true, lastUpdate: state.lastUpdate });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
+}

@@ -1,0 +1,1 @@
+{"pairs":["BTC/USDT","ETH/USDT","SOL/USDT"],"gridLevels":10,"spacingPct":0.3,"positionSizeUsd":100,"leverage":10,"maxOpenPerPair":5,"maxOpenTotal":15,"tickIntervalMs":3000,"rebuildDriftPct":2.0,"roundtripFeePct":0.11}

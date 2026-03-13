@@ -1,0 +1,794 @@
+/**
+ * Hybrid Scanner V2 — Continuation Strategy
+ * 
+ * Two modes:
+ *   1m micro-scalp continuation (bias: 5m EMA50 + RSI)
+ *   15m pullback continuation (bias: 1h EMA200)
+ * 
+ * Runs alongside the existing StochRSI scanner (v1).
+ * Writes to: public/v2-scalp-signals.json and public/v2-swing-signals.json
+ */
+
+const WebSocket = require('ws');
+const ccxt = require('ccxt');
+const fs = require('fs');
+const path = require('path');
+
+const OUTPUT_SCALP = path.join(__dirname, '..', 'public', 'v2-scalp-signals.json');
+const OUTPUT_SWING = path.join(__dirname, '..', 'public', 'v2-swing-signals.json');
+const WRITE_INTERVAL = 10 * 1000;
+const LOG_INTERVAL = 60 * 1000;
+const MAX_CANDLES = 250; // Need more for EMA200 on 1h
+const TOP_PAIRS = 250; // 1m scans top 250 by volume
+const ALL_PAIRS_MAX = 500; // 15m scans top 500
+
+// ── Indicator Library ──
+
+function calcEMA(data, period) {
+  if (data.length < period) return [];
+  const k = 2 / (period + 1);
+  const ema = [data.slice(0, period).reduce((a, b) => a + b, 0) / period];
+  for (let i = period; i < data.length; i++) {
+    ema.push(data[i] * k + ema[ema.length - 1] * (1 - k));
+  }
+  return ema;
+}
+
+function calcRSI(closes, period) {
+  if (closes.length < period + 1) return [];
+  const rsi = [];
+  let avgGain = 0, avgLoss = 0;
+  // Seed
+  for (let i = 1; i <= period; i++) {
+    const ch = closes[i] - closes[i - 1];
+    if (ch > 0) avgGain += ch; else avgLoss -= ch;
+  }
+  avgGain /= period;
+  avgLoss /= period;
+  rsi.push(avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss));
+
+  for (let i = period + 1; i < closes.length; i++) {
+    const ch = closes[i] - closes[i - 1];
+    avgGain = (avgGain * (period - 1) + (ch > 0 ? ch : 0)) / period;
+    avgLoss = (avgLoss * (period - 1) + (ch < 0 ? -ch : 0)) / period;
+    rsi.push(avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss));
+  }
+  return rsi;
+}
+
+function calcMACD(closes, fast, slow, signal) {
+  const emaFast = calcEMA(closes, fast);
+  const emaSlow = calcEMA(closes, slow);
+  if (emaFast.length === 0 || emaSlow.length === 0) return { line: [], signal: [], histogram: [] };
+
+  // Align: emaSlow starts later
+  const offset = slow - fast;
+  const line = [];
+  for (let i = 0; i < emaSlow.length; i++) {
+    line.push(emaFast[i + offset] - emaSlow[i]);
+  }
+
+  const sigLine = calcEMA(line, signal);
+  const sigOffset = line.length - sigLine.length;
+  const histogram = [];
+  for (let i = 0; i < sigLine.length; i++) {
+    histogram.push(line[i + sigOffset] - sigLine[i]);
+  }
+
+  return { line, signal: sigLine, histogram };
+}
+
+function calcATR(highs, lows, closes, period) {
+  if (highs.length < period + 1) return 0;
+  let sum = 0;
+  for (let i = highs.length - period; i < highs.length; i++) {
+    sum += Math.max(highs[i] - lows[i], Math.abs(highs[i] - closes[i - 1]), Math.abs(lows[i] - closes[i - 1]));
+  }
+  return sum / period;
+}
+
+function last(arr) { return arr.length > 0 ? arr[arr.length - 1] : null; }
+function prev(arr, n = 1) { return arr.length > n ? arr[arr.length - 1 - n] : null; }
+
+// ── Candle Storage ──
+// Keyed by "symbol:timeframe"
+const candles = Object.create(null);
+
+function candleKey(symbol, tf) { return symbol + ':' + tf; }
+
+function getCandles(symbol, tf) {
+  return candles[candleKey(symbol, tf)] || null;
+}
+
+function setCandles(symbol, tf, data) {
+  candles[candleKey(symbol, tf)] = data;
+}
+
+function trimCandleData(data) {
+  if (data.closes.length > MAX_CANDLES) {
+    const excess = data.closes.length - MAX_CANDLES;
+    data.closes.splice(0, excess);
+    data.highs.splice(0, excess);
+    data.lows.splice(0, excess);
+    data.volumes.splice(0, excess);
+  }
+}
+
+// ── 1m Micro-Scalp Continuation Scanner ──
+
+function scan1m(symbol) {
+  const d1 = getCandles(symbol, '1m');
+  const d5 = getCandles(symbol, '5m');
+  if (!d1 || d1.closes.length < 60 || !d5 || d5.closes.length < 55) return null;
+
+  const c1 = d1.closes, h1 = d1.highs, l1 = d1.lows, v1 = d1.volumes;
+  const c5 = d5.closes;
+  const price = c1[c1.length - 1];
+
+  // 5m bias
+  const ema50_5m = calcEMA(c5, 50);
+  const rsi_5m = calcRSI(c5, 14);
+  if (ema50_5m.length === 0 || rsi_5m.length === 0) return null;
+
+  const price5m = c5[c5.length - 1];
+  const aboveEma50_5m = price5m > last(ema50_5m);
+  const belowEma50_5m = price5m < last(ema50_5m);
+  const rsi5mVal = last(rsi_5m);
+
+  // 1m indicators
+  const ema9 = calcEMA(c1, 9);
+  const ema21 = calcEMA(c1, 21);
+  const ema50 = calcEMA(c1, 50);
+  if (ema9.length < 3 || ema21.length < 3 || ema50.length < 3) return null;
+
+  const ema9v = last(ema9), ema21v = last(ema21), ema50v = last(ema50);
+  const rsi7 = calcRSI(c1, 7);
+  if (rsi7.length < 3) return null;
+  const rsi7v = last(rsi7);
+  const rsi7prev = prev(rsi7);
+
+  const macd = calcMACD(c1, 5, 13, 6);
+  if (macd.histogram.length < 3) return null;
+  const hist = last(macd.histogram);
+  const histPrev = prev(macd.histogram);
+  const histPrev2 = prev(macd.histogram, 2);
+
+  // ATR
+  const atr = calcATR(h1, l1, c1, 14);
+  const atrPct = (atr / price) * 100;
+
+  // Volume
+  const volLen = v1.length;
+  const volStart = Math.max(0, volLen - 20);
+  let volSum = 0;
+  for (let i = volStart; i < volLen; i++) volSum += v1[i];
+  const avgVol = volSum / Math.min(20, volLen - volStart);
+  const volRatio = avgVol > 0 ? v1[volLen - 1] / avgVol : 1;
+
+  // Candle body/range ratio
+  const lastOpen = c1.length > 1 ? c1[c1.length - 2] : price; // approximation
+  const bodyRange = h1[h1.length - 1] - l1[l1.length - 1];
+  const body = Math.abs(price - lastOpen);
+  const bodyRatio = bodyRange > 0 ? body / bodyRange : 0;
+
+  // Micro swing high/low (last 3 candles)
+  const recentHighs = h1.slice(-4, -1);
+  const recentLows = l1.slice(-4, -1);
+  const microSwingHigh = Math.max(...recentHighs);
+  const microSwingLow = Math.min(...recentLows);
+
+  // ── LONG criteria ──
+  const longBias = aboveEma50_5m && rsi5mVal > 52;
+  const longEmaStack = ema9v > ema21v && ema21v > ema50v;
+  const longPullback = price >= Math.min(ema9v, ema21v) * 0.998 && price <= Math.max(ema9v, ema21v) * 1.003;
+  const longRsi = rsi7v >= 35 && rsi7v <= 65;
+  const longMacd = hist > 0 || (hist > histPrev && histPrev < 0);
+  const longVolume = volRatio >= 1.20;
+  const longAtr = atrPct >= 0.08;
+  const longBody = bodyRatio >= 0.55;
+  const longEntry = price > microSwingHigh; // Break of micro swing high
+
+  // ── SHORT criteria ──
+  const shortBias = belowEma50_5m && rsi5mVal < 48;
+  const shortEmaStack = ema9v < ema21v && ema21v < ema50v;
+  const shortPullback = price <= Math.max(ema9v, ema21v) * 1.002 && price >= Math.min(ema9v, ema21v) * 0.997;
+  const shortRsi = rsi7v >= 35 && rsi7v <= 65;
+  const shortMacd = hist < 0 || (hist < histPrev && histPrev > 0);
+  const shortVolume = volRatio >= 1.20;
+  const shortAtr = atrPct >= 0.08;
+  const shortBody = bodyRatio >= 0.55;
+  const shortEntry = price < microSwingLow;
+
+  let signal = 'NEUTRAL', confidence = 0, reason = '', direction = 'NEUTRAL';
+  const criteria = {
+    bias: false, emaStack: false, pullback: false, rsi: false,
+    macd: false, volume: false, atr: false, body: false, entry: false,
+  };
+
+  // Scoring: need at least 3 of 4 core criteria (EMA stack, RSI, MACD, ATR)
+  const longScore = (longEmaStack ? 1 : 0) + (longRsi ? 1 : 0) + (longMacd ? 1 : 0) + (longAtr ? 1 : 0);
+  const shortScore = (shortEmaStack ? 1 : 0) + (shortRsi ? 1 : 0) + (shortMacd ? 1 : 0) + (shortAtr ? 1 : 0);
+  if (longEmaStack && longScore >= 3) {
+    signal = 'LONG'; direction = 'LONG';
+    criteria.emaStack = longEmaStack; criteria.rsi = longRsi;
+    criteria.macd = longMacd; criteria.atr = longAtr;
+
+    confidence = 50;
+    if (longBias) { confidence += 10; criteria.bias = true; }
+    if (longPullback) { confidence += 10; criteria.pullback = true; }
+    if (longVolume) { confidence += 8; criteria.volume = true; }
+    if (longBody) { confidence += 5; criteria.body = true; }
+    if (longEntry) { confidence += 7; criteria.entry = true; }
+
+    const parts = [];
+    if (longBias) parts.push('5m bias OK');
+    parts.push('EMA 9>21>50');
+    parts.push('RSI7 ' + rsi7v.toFixed(0));
+    if (longVolume) parts.push('Vol ' + volRatio.toFixed(1) + 'x');
+    if (longEntry) parts.push('BREAK HIGH');
+    reason = parts.join(' | ');
+  } else if (shortEmaStack && shortScore >= 3) {
+    signal = 'SHORT'; direction = 'SHORT';
+    criteria.emaStack = shortEmaStack; criteria.rsi = shortRsi;
+    criteria.macd = shortMacd; criteria.atr = shortAtr;
+
+    confidence = 50;
+    if (shortBias) { confidence += 10; criteria.bias = true; }
+    if (shortPullback) { confidence += 10; criteria.pullback = true; }
+    if (shortVolume) { confidence += 8; criteria.volume = true; }
+    if (shortBody) { confidence += 5; criteria.body = true; }
+    if (shortEntry) { confidence += 7; criteria.entry = true; }
+
+    const parts = [];
+    if (shortBias) parts.push('5m bias OK');
+    parts.push('EMA 9<21<50');
+    parts.push('RSI7 ' + rsi7v.toFixed(0));
+    if (shortVolume) parts.push('Vol ' + volRatio.toFixed(1) + 'x');
+    if (shortEntry) parts.push('BREAK LOW');
+    reason = parts.join(' | ');
+  }
+
+  confidence = Math.min(95, confidence);
+
+  // R-based SL/TP
+  const slDistance = 0.10 * atr;
+  const slPrice = direction === 'LONG' ? microSwingLow - slDistance : microSwingHigh + slDistance;
+  let riskPerUnit = Math.abs(price - slPrice);
+  
+  // Enforce minimum SL distance: at least 0.3% of price
+  // This prevents instant SL hits from tiny noise moves
+  const MIN_SL_PCT = 0.003; // 0.3%
+  const minSlDistance = price * MIN_SL_PCT;
+  if (riskPerUnit < minSlDistance) {
+    riskPerUnit = minSlDistance;
+  }
+  // Only skip if stop is extremely wide (> 2.0 ATR). Penalize confidence for wide stops.
+  const stopWidthRatio = atr > 0 ? riskPerUnit / atr : 999;
+
+  // Fee awareness: ensure TP covers at least 2.5x the roundtrip fee cost
+  // Bybit taker roundtrip = 0.055% * 2 = 0.11% of position value
+  // We need TP price movement > 0.11% * 2.5 = 0.275% minimum
+  const ROUNDTRIP_FEE_PCT = 0.11; // taker worst case
+  const MIN_PROFIT_MULTIPLE = 2.5; // TP must be 2.5x fees
+  const minTpPriceMovePct = ROUNDTRIP_FEE_PCT * MIN_PROFIT_MULTIPLE / 100; // 0.00275
+  const minTpDistance = price * minTpPriceMovePct;
+
+  // Calculate TP based on R, but enforce minimum distance for fee coverage
+  const rawTpDistance = riskPerUnit * 1.50;
+  const rawTpDistanceStrong = riskPerUnit * 2.00;
+  const effectiveTpDistance = Math.max(rawTpDistance, minTpDistance);
+  const effectiveTpDistanceStrong = Math.max(rawTpDistanceStrong, minTpDistance);
+
+  // Also skip if even the minimum TP doesn't clear fees (riskPerUnit too small)
+  const tpCoversFees = effectiveTpDistance > minTpDistance * 0.9;
+  const skipTrade = signal === 'NEUTRAL' || stopWidthRatio > 2.0 || !tpCoversFees;
+  if (stopWidthRatio > 1.0 && !skipTrade) {
+    confidence = Math.max(40, confidence - Math.round((stopWidthRatio - 1.0) * 15));
+  }
+
+  return {
+    pair: symbol, symbol, signal, direction,
+    confidence: Math.round(confidence),
+    reason: skipTrade ? reason + ' [SKIP: ' + (stopWidthRatio > 2.0 ? 'stop too wide' : !tpCoversFees ? 'TP < fees' : 'no setup') + ']' : reason,
+    skipTrade,
+    criteriaMet: Object.values(criteria).filter(Boolean).length,
+    criteriaTotal: Object.keys(criteria).length,
+    criteriaDetails: criteria,
+    trade: skipTrade ? null : {
+      stopLoss: +(direction === 'LONG' ? price - riskPerUnit : price + riskPerUnit).toFixed(6),
+      takeProfit: +(price + effectiveTpDistance * (direction === 'LONG' ? 1 : -1)).toFixed(6),
+      takeProfitStrong: +(price + effectiveTpDistanceStrong * (direction === 'LONG' ? 1 : -1)).toFixed(6),
+      breakEvenAt: +(price + riskPerUnit * 0.75 * (direction === 'LONG' ? 1 : -1)).toFixed(6),
+      riskR: +riskPerUnit.toFixed(6),
+      feeCostPct: ROUNDTRIP_FEE_PCT,
+      tpToFeeRatio: +(effectiveTpDistance / (price * ROUNDTRIP_FEE_PCT / 100)).toFixed(2),
+      timeStopCandles: 6,
+    },
+    indicators: {
+      price: +price.toFixed(6),
+      ema9: +ema9v.toFixed(6), ema21: +ema21v.toFixed(6), ema50: +ema50v.toFixed(6),
+      rsi7: +rsi7v.toFixed(2),
+      macdHist: +hist.toFixed(6),
+      volumeRatio: +volRatio.toFixed(2),
+      atrPercent: +atrPct.toFixed(3),
+      atr: +atr.toFixed(6),
+      bodyRatio: +bodyRatio.toFixed(2),
+      microSwingHigh: +microSwingHigh.toFixed(6),
+      microSwingLow: +microSwingLow.toFixed(6),
+      rsi5m: +(rsi5mVal || 0).toFixed(2),
+      ema50_5m: +(last(ema50_5m) || 0).toFixed(6),
+    },
+  };
+}
+
+// ── 15m Pullback Continuation Scanner ──
+
+function scan15m(symbol) {
+  const d15 = getCandles(symbol, '15m');
+  const d1h = getCandles(symbol, '1h');
+  if (!d15 || d15.closes.length < 60 || !d1h || d1h.closes.length < 210) return null;
+
+  const c15 = d15.closes, h15 = d15.highs, l15 = d15.lows, v15 = d15.volumes;
+  const c1h = d1h.closes;
+  const price = c15[c15.length - 1];
+
+  // 1h bias: EMA200
+  const ema200_1h = calcEMA(c1h, 200);
+  if (ema200_1h.length === 0) return null;
+  const above1hEma200 = price > last(ema200_1h);
+  const below1hEma200 = price < last(ema200_1h);
+
+  // 15m indicators
+  const ema20 = calcEMA(c15, 20);
+  const ema50 = calcEMA(c15, 50);
+  if (ema20.length < 4 || ema50.length < 4) return null;
+
+  const ema20v = last(ema20), ema50v = last(ema50);
+  const ema20prev = prev(ema20), ema50prev = prev(ema50);
+  const ema20rising = ema20v > ema20prev;
+  const ema50rising = ema50v > ema50prev;
+  const ema20falling = ema20v < ema20prev;
+  const ema50falling = ema50v < ema50prev;
+
+  const rsi14 = calcRSI(c15, 14);
+  if (rsi14.length < 2) return null;
+  const rsiVal = last(rsi14);
+
+  const macd = calcMACD(c15, 12, 26, 9);
+  if (macd.histogram.length < 3) return null;
+  const hist = last(macd.histogram);
+  const histPrev = prev(macd.histogram);
+  const histRising = hist > histPrev;
+  const histFalling = hist < histPrev;
+  const macdLine = last(macd.line);
+  const macdSignal = last(macd.signal);
+
+  // ATR
+  const atr = calcATR(h15, l15, c15, 14);
+  const atrPct = (atr / price) * 100;
+
+  // Volume
+  const volLen = v15.length;
+  const volStart = Math.max(0, volLen - 20);
+  let volSum = 0;
+  for (let i = volStart; i < volLen; i++) volSum += v15[i];
+  const avgVol = volSum / Math.min(20, volLen - volStart);
+  const volRatio = avgVol > 0 ? v15[volLen - 1] / avgVol : 1;
+
+  // Candle body/range
+  const bodyRange = h15[h15.length - 1] - l15[l15.length - 1];
+  const prevClose = c15.length > 1 ? c15[c15.length - 2] : price;
+  const body = Math.abs(price - prevClose);
+  const bodyRatio = bodyRange > 0 ? body / bodyRange : 0;
+
+  // Pullback detection: price pulled back to EMA20 zone in last 1-3 candles
+  let pullbackDetected = false;
+  for (let i = 1; i <= 3 && i < c15.length; i++) {
+    const lookback = c15.length - 1 - i;
+    const pLow = l15[lookback];
+    const pHigh = h15[lookback];
+    const ema20AtBar = ema20.length > i ? ema20[ema20.length - 1 - i] : ema20v;
+    const ema50AtBar = ema50.length > i ? ema50[ema50.length - 1 - i] : ema50v;
+    // Price touched the EMA20-EMA50 zone
+    if (pLow <= Math.max(ema20AtBar, ema50AtBar) * 1.002 &&
+        pHigh >= Math.min(ema20AtBar, ema50AtBar) * 0.998) {
+      pullbackDetected = true;
+      break;
+    }
+  }
+
+  // Signal candle high/low for entry trigger
+  const signalHigh = h15[h15.length - 1];
+  const signalLow = l15[l15.length - 1];
+
+  // ── LONG criteria ──
+  const longBias = above1hEma200;
+  const longTrend = ema20v > ema50v;
+  const longRsi = rsiVal >= 40 && rsiVal <= 65;
+  const longMacd = hist > 0 || histRising;
+  const longVolume = volRatio >= 1.20;
+  const longAtr = atrPct >= 0.20;
+  const longBody = bodyRatio >= 0.55;
+  const longCloseAboveEma = price > ema20v; // Current candle closes above EMA20
+
+  // ── SHORT criteria ──
+  const shortBias = below1hEma200;
+  const shortTrend = ema20v < ema50v;
+  const shortRsi = rsiVal >= 35 && rsiVal <= 60;
+  const shortMacd = hist < 0 || histFalling;
+  const shortVolume = volRatio >= 1.20;
+  const shortAtr = atrPct >= 0.20;
+  const shortBody = bodyRatio >= 0.55;
+  const shortCloseBelowEma = price < ema20v;
+
+  let signal = 'NEUTRAL', confidence = 0, reason = '', direction = 'NEUTRAL';
+  const criteria = {
+    htfBias: false, trend: false, pullback: false, closeAboveBelow: false,
+    rsi: false, macd: false, volume: false, atr: false, body: false,
+  };
+
+  // Scoring system: trend is required, then need 3+ of remaining criteria
+  const longCoreScore = (longBias ? 1 : 0) + (longRsi ? 1 : 0) + (longMacd ? 1 : 0) + (longAtr ? 1 : 0) + (longCloseAboveEma ? 1 : 0);
+  const shortCoreScore = (shortBias ? 1 : 0) + (shortRsi ? 1 : 0) + (shortMacd ? 1 : 0) + (shortAtr ? 1 : 0) + (shortCloseBelowEma ? 1 : 0);
+
+  if (longTrend && longCoreScore >= 3) {
+    signal = 'LONG'; direction = 'LONG';
+    criteria.trend = true;
+    confidence = 45;
+    if (longBias) { confidence += 8; criteria.htfBias = true; }
+    if (longRsi) { confidence += 8; criteria.rsi = true; }
+    if (longMacd) { confidence += 7; criteria.macd = true; }
+    if (longAtr) { confidence += 5; criteria.atr = true; }
+    if (longCloseAboveEma) { confidence += 5; criteria.closeAboveBelow = true; }
+    if (pullbackDetected) { confidence += 12; criteria.pullback = true; }
+    if (longVolume) { confidence += 6; criteria.volume = true; }
+    if (longBody) { confidence += 4; criteria.body = true; }
+
+    const parts = [];
+    if (longBias) parts.push('1h > EMA200');
+    parts.push('EMA20>50');
+    parts.push('RSI ' + rsiVal.toFixed(0));
+    if (pullbackDetected) parts.push('PULLBACK');
+    if (longVolume) parts.push('Vol ' + volRatio.toFixed(1) + 'x');
+    if (longMacd) parts.push('MACD OK');
+    reason = parts.join(' | ');
+  } else if (shortTrend && shortCoreScore >= 3) {
+    signal = 'SHORT'; direction = 'SHORT';
+    criteria.trend = true;
+    confidence = 45;
+    if (shortBias) { confidence += 8; criteria.htfBias = true; }
+    if (shortRsi) { confidence += 8; criteria.rsi = true; }
+    if (shortMacd) { confidence += 7; criteria.macd = true; }
+    if (shortAtr) { confidence += 5; criteria.atr = true; }
+    if (shortCloseBelowEma) { confidence += 5; criteria.closeAboveBelow = true; }
+    if (pullbackDetected) { confidence += 12; criteria.pullback = true; }
+    if (shortVolume) { confidence += 6; criteria.volume = true; }
+    if (shortBody) { confidence += 4; criteria.body = true; }
+
+    const parts = [];
+    if (shortBias) parts.push('1h < EMA200');
+    parts.push('EMA20<50');
+    parts.push('RSI ' + rsiVal.toFixed(0));
+    if (pullbackDetected) parts.push('PULLBACK');
+    if (shortVolume) parts.push('Vol ' + volRatio.toFixed(1) + 'x');
+    if (shortMacd) parts.push('MACD OK');
+    reason = parts.join(' | ');
+  }
+
+  confidence = Math.min(95, confidence);
+
+  // R-based SL/TP for 15m
+  // SL = pullback low - 0.15*ATR, capped at 1.20*ATR
+  const pullbackLow = Math.min(...l15.slice(-4));
+  const pullbackHigh = Math.max(...h15.slice(-4));
+  const slRaw = direction === 'LONG'
+    ? pullbackLow - 0.15 * atr
+    : pullbackHigh + 0.15 * atr;
+  const riskPerUnitRaw = Math.abs(price - slRaw);
+  
+  // Enforce minimum SL distance: at least 0.5% of price for 15m swing
+  const MIN_SL_PCT_15 = 0.005; // 0.5%
+  const minSlDistance15 = price * MIN_SL_PCT_15;
+  const riskPerUnit = Math.max(riskPerUnitRaw, minSlDistance15);
+  
+  const stopWidthRatio15 = atr > 0 ? riskPerUnit / atr : 999;
+
+  // Fee awareness: TP must cover at least 2.5x roundtrip fees
+  const ROUNDTRIP_FEE_PCT_15 = 0.11;
+  const MIN_PROFIT_MULTIPLE_15 = 2.5;
+  const minTpDistance15 = price * (ROUNDTRIP_FEE_PCT_15 * MIN_PROFIT_MULTIPLE_15 / 100);
+
+  const skipTrade = signal === 'NEUTRAL' || stopWidthRatio15 > 2.5;
+  if (stopWidthRatio15 > 1.2 && !skipTrade) {
+    confidence = Math.max(40, confidence - Math.round((stopWidthRatio15 - 1.2) * 10));
+  }
+
+  // TP: 1.50R standard, 2.00R if strong (volume >= 1.5x and MACD accelerating)
+  const isStrong = volRatio >= 1.5 && (direction === 'LONG' ? histRising : histFalling);
+  const tpR = isStrong ? 2.00 : 1.50;
+
+  // Enforce minimum TP distance for fee coverage
+  const rawTpDistance15 = riskPerUnit * tpR;
+  const effectiveTpDistance15 = Math.max(rawTpDistance15, minTpDistance15);
+
+  return {
+    pair: symbol, symbol, signal, direction,
+    confidence: Math.round(confidence),
+    reason: skipTrade ? reason + ' [SKIP: stop too wide]' : reason,
+    skipTrade,
+    criteriaMet: Object.values(criteria).filter(Boolean).length,
+    criteriaTotal: Object.keys(criteria).length,
+    criteriaDetails: criteria,
+    trade: skipTrade ? null : {
+      stopLoss: +(direction === 'LONG' ? price - riskPerUnit : price + riskPerUnit).toFixed(6),
+      takeProfit: +(price + effectiveTpDistance15 * (direction === 'LONG' ? 1 : -1)).toFixed(6),
+      breakEvenAt: +(price + riskPerUnit * 0.75 * (direction === 'LONG' ? 1 : -1)).toFixed(6),
+      riskR: +riskPerUnit.toFixed(6),
+      tpMultiple: tpR,
+      isStrongSetup: isStrong,
+      feeCostPct: ROUNDTRIP_FEE_PCT_15,
+      tpToFeeRatio: +(effectiveTpDistance15 / (price * ROUNDTRIP_FEE_PCT_15 / 100)).toFixed(2),
+      timeStopCandles: 8,
+      signalHigh: +signalHigh.toFixed(6),
+      signalLow: +signalLow.toFixed(6),
+    },
+    indicators: {
+      price: +price.toFixed(6),
+      ema20: +ema20v.toFixed(6), ema50: +ema50v.toFixed(6),
+      ema200_1h: +(last(ema200_1h) || 0).toFixed(6),
+      rsi14: +rsiVal.toFixed(2),
+      macdHist: +hist.toFixed(6), macdLine: +(macdLine || 0).toFixed(6),
+      volumeRatio: +volRatio.toFixed(2),
+      atrPercent: +atrPct.toFixed(3),
+      atr: +atr.toFixed(6),
+      bodyRatio: +bodyRatio.toFixed(2),
+      pullbackDetected,
+    },
+  };
+}
+
+// ── Data Fetching ──
+
+let exchange = null;
+let allPairNames = [];
+let topPairNames = [];
+let lastLog = 0;
+
+async function fetchOHLCV(pairs, tf, limit) {
+  const BATCH = 8;
+  for (let i = 0; i < pairs.length; i += BATCH) {
+    const batch = pairs.slice(i, i + BATCH);
+    await Promise.all(batch.map(async (pair) => {
+      try {
+        const ohlcv = await exchange.fetchOHLCV(pair, tf, undefined, limit);
+        if (!ohlcv || ohlcv.length < 30) return;
+        const key = candleKey(pair, tf);
+        if (!candles[key]) candles[key] = { closes: [], highs: [], lows: [], volumes: [] };
+        const c = candles[key];
+        c.closes.length = 0; c.highs.length = 0; c.lows.length = 0; c.volumes.length = 0;
+        const start = Math.max(0, ohlcv.length - MAX_CANDLES);
+        for (let j = start; j < ohlcv.length; j++) {
+          c.closes.push(ohlcv[j][4]);
+          c.highs.push(ohlcv[j][2]);
+          c.lows.push(ohlcv[j][3]);
+          c.volumes.push(ohlcv[j][5]);
+        }
+      } catch (e) { /* skip */ }
+    }));
+    if (i + BATCH < pairs.length) await new Promise(r => setTimeout(r, 500));
+  }
+}
+
+// ── WebSocket for 1m candles (top pairs) ──
+let wsInstance = null;
+
+function connectWS() {
+  if (wsInstance) { try { wsInstance.terminate(); } catch {} }
+  wsInstance = new WebSocket('wss://stream.bybit.com/v5/public/spot', { maxPayload: 1024 * 1024 });
+
+  wsInstance.on('open', () => {
+    console.log('[V2-WS] Connected, subscribing to ' + topPairNames.length + ' pairs (1m klines)...');
+    const args = topPairNames.map(p => 'kline.1.' + p.replace('/', ''));
+    for (let i = 0; i < args.length; i += 10) {
+      const batch = args.slice(i, i + 10);
+      setTimeout(() => {
+        if (wsInstance && wsInstance.readyState === WebSocket.OPEN) {
+          wsInstance.send(JSON.stringify({ op: 'subscribe', args: batch }));
+        }
+      }, (i / 10) * 100);
+    }
+  });
+
+  wsInstance.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (!msg.topic || !msg.topic.startsWith('kline.1.') || !msg.data) return;
+      const sym = msg.topic.slice(8).replace('USDT', '/USDT');
+      const d = Array.isArray(msg.data) ? msg.data[0] : msg.data;
+      if (!d) return;
+      const c = getCandles(sym, '1m');
+      if (!c) return;
+
+      const close = parseFloat(d.close);
+      const high = parseFloat(d.high);
+      const low = parseFloat(d.low);
+      const vol = parseFloat(d.volume);
+
+      if (d.confirm) {
+        c.closes.push(close); c.highs.push(high); c.lows.push(low); c.volumes.push(vol);
+        trimCandleData(c);
+      } else {
+        const last = c.closes.length - 1;
+        if (last >= 0) {
+          c.closes[last] = close;
+          c.highs[last] = Math.max(c.highs[last], high);
+          c.lows[last] = Math.min(c.lows[last], low);
+          c.volumes[last] = vol;
+        }
+      }
+    } catch (e) { /* skip */ }
+  });
+
+  wsInstance.on('close', () => { setTimeout(connectWS, 5000); });
+  wsInstance.on('error', (e) => console.error('[V2-WS] Error:', e.message));
+}
+
+// ── Write results ──
+
+function writeScalpResults() {
+  const signals = [];
+  const prices = Object.create(null);
+  for (const pair of topPairNames) {
+    const sig = scan1m(pair);
+    if (sig) {
+      signals.push(sig);
+      if (sig.indicators.price > 0) prices[sig.symbol] = sig.indicators.price;
+    }
+  }
+
+  const active = signals.filter(s => s.signal !== 'NEUTRAL' && !s.skipTrade);
+  signals.sort((a, b) => b.confidence - a.confidence);
+
+  const data = {
+    success: true,
+    version: 'v2-continuation',
+    scanner: '1m-micro-scalp',
+    timestamp: new Date().toISOString(),
+    scannedPairs: topPairNames.length,
+    prices,
+    signals: signals.slice(0, 200),
+  };
+
+  try {
+    const tmp = OUTPUT_SCALP + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(data));
+    fs.renameSync(tmp, OUTPUT_SCALP);
+  } catch (e) { console.error('[V2] Write scalp error:', e.message); }
+
+  const now = Date.now();
+  if (now - lastLog > LOG_INTERVAL) {
+    console.log('[V2-1m] Signals: ' + active.length + ' (' +
+      active.filter(s => s.signal === 'LONG').length + 'L/' +
+      active.filter(s => s.signal === 'SHORT').length + 'S) from ' +
+      topPairNames.length + ' pairs');
+    lastLog = now;
+  }
+}
+
+function writeSwingResults() {
+  const signals = [];
+  const prices = Object.create(null);
+  for (const pair of allPairNames) {
+    const sig = scan15m(pair);
+    if (sig) {
+      signals.push(sig);
+      if (sig.indicators.price > 0) prices[sig.symbol] = sig.indicators.price;
+    }
+  }
+
+  const active = signals.filter(s => s.signal !== 'NEUTRAL' && !s.skipTrade);
+  signals.sort((a, b) => b.confidence - a.confidence);
+
+  const data = {
+    success: true,
+    version: 'v2-continuation',
+    scanner: '15m-pullback',
+    timestamp: new Date().toISOString(),
+    scannedPairs: allPairNames.length,
+    prices,
+    signals: signals.slice(0, 400),
+  };
+
+  try {
+    const tmp = OUTPUT_SWING + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(data));
+    fs.renameSync(tmp, OUTPUT_SWING);
+  } catch (e) { console.error('[V2] Write swing error:', e.message); }
+
+  console.log('[V2-15m] Signals: ' + active.length + ' (' +
+    active.filter(s => s.signal === 'LONG').length + 'L/' +
+    active.filter(s => s.signal === 'SHORT').length + 'S) from ' +
+    allPairNames.length + ' pairs');
+}
+
+// ── Main ──
+
+async function main() {
+  console.log('=== V2 Continuation Scanner starting ===');
+  exchange = new ccxt.bybit({ enableRateLimit: true, rateLimit: 250 });
+  await exchange.loadTimeDifference();
+
+  console.log('[V2] Fetching markets...');
+  const markets = await exchange.loadMarkets();
+  const tickers = await exchange.fetchTickers();
+
+  const usdtPairs = Object.values(markets)
+    .filter(m => m.quote === 'USDT' && m.type === 'spot' && m.active)
+    .map(m => {
+      const t = tickers[m.symbol + ':USDT'] || tickers[m.symbol];
+      return { symbol: m.symbol, volume: t?.quoteVolume || 0 };
+    })
+    .filter(p => p.volume >= 50000) // Lower threshold for more pair diversity
+    .sort((a, b) => b.volume - a.volume);
+
+  topPairNames = usdtPairs.slice(0, TOP_PAIRS).map(p => p.symbol);
+  allPairNames = usdtPairs.slice(0, ALL_PAIRS_MAX).map(p => p.symbol);
+
+  console.log('[V2] Top ' + topPairNames.length + ' pairs (1m scalp)');
+  console.log('[V2] All ' + allPairNames.length + ' pairs (15m swing)');
+
+  // Fetch multi-timeframe candles
+  console.log('[V2] Fetching 1m candles for top pairs...');
+  await fetchOHLCV(topPairNames, '1m', MAX_CANDLES);
+
+  console.log('[V2] Fetching 5m candles for top pairs (bias filter)...');
+  await fetchOHLCV(topPairNames, '5m', 100);
+
+  console.log('[V2] Fetching 15m candles for all pairs...');
+  await fetchOHLCV(allPairNames, '15m', MAX_CANDLES);
+
+  console.log('[V2] Fetching 1h candles for all pairs (HTF bias)...');
+  await fetchOHLCV(allPairNames, '1h', MAX_CANDLES);
+
+  console.log('[V2] Initial data loaded. Candle sets: ' + Object.keys(candles).length);
+
+  // WebSocket for realtime 1m updates
+  connectWS();
+
+  // 1m scalp results every 10s
+  writeScalpResults();
+  setInterval(writeScalpResults, WRITE_INTERVAL);
+
+  // 15m swing results every 60s (15m candles don't need faster)
+  writeSwingResults();
+  setInterval(writeSwingResults, 60 * 1000);
+
+  // Refresh 5m candles every 5 min
+  setInterval(async () => {
+    try { await fetchOHLCV(topPairNames, '5m', 100); }
+    catch (e) { console.error('[V2] 5m refresh error:', e.message); }
+  }, 5 * 60 * 1000);
+
+  // Refresh 15m + 1h candles every 15 min
+  setInterval(async () => {
+    try {
+      await fetchOHLCV(allPairNames, '15m', MAX_CANDLES);
+      await fetchOHLCV(allPairNames, '1h', MAX_CANDLES);
+    } catch (e) { console.error('[V2] 15m/1h refresh error:', e.message); }
+  }, 15 * 60 * 1000);
+
+  // Memory cleanup every 30 min
+  setInterval(() => {
+    const active = new Set();
+    for (const p of topPairNames) { active.add(candleKey(p, '1m')); active.add(candleKey(p, '5m')); }
+    for (const p of allPairNames) { active.add(candleKey(p, '15m')); active.add(candleKey(p, '1h')); }
+    let cleaned = 0;
+    for (const k in candles) { if (!active.has(k)) { delete candles[k]; cleaned++; } }
+    if (cleaned > 0) console.log('[V2] Cleaned ' + cleaned + ' stale candle sets');
+    if (global.gc) global.gc();
+  }, 30 * 60 * 1000);
+
+  console.log('=== V2 Continuation Scanner running ===');
+}
+
+main().catch(e => { console.error('[V2] Fatal:', e); process.exit(1); });
