@@ -38,16 +38,23 @@ This scanner generates trading signals specifically optimized for Polymarket bin
    - Filter validation logic
    - Event analyzer
 
-2. **Scanner Daemon** (`scripts/pm-scanner-daemon.cjs`)
-   - Standalone Node.js process
+2. **PM Scanner Daemon** (`scripts/pm-scanner-daemon.cjs`)
+   - Standalone Node.js process (updates every 10s)
    - Fetches data from multiple sources:
      - Bybit OHLCV (via CCXT)
      - Oracle prices (CoinGecko/Chainlink)
-     - Polymarket odds (Gamma API)
+     - PM Bot live events (via state API)
      - Market regime data
    - Outputs to `public/pm-signals.json`
 
-3. **API Endpoint** (`app/api/pm-bot/signals/route.ts`)
+3. **Market Regime Daemon** (`scripts/regime-scanner-daemon.cjs`)
+   - Standalone Node.js process (updates every 60s)
+   - Analyzes BTC market conditions:
+     - 5-factor regime scoring (EMA/RSI/MACD/Volatility/Price Action)
+     - Determines BULLISH/BEARISH/RANGING/HIGH_VOLATILITY states
+   - Outputs to `public/pm-market-regime.json`
+
+4. **API Endpoint** (`app/api/pm-bot/signals/route.ts`)
    - Next.js API route for dashboard consumption
 
 ## Signal Format
@@ -86,16 +93,30 @@ npm install
 
 ## Usage
 
-### Start the Scanner Daemon
+### Start Both Daemons
 
+**Market Regime Scanner** (run first):
+```bash
+node scripts/regime-scanner-daemon.cjs
+```
+
+The regime daemon will:
+- Run every 60 seconds
+- Analyze BTC market conditions
+- Update `public/pm-market-regime.json`
+- Log regime state to console
+
+**PM Signal Scanner**:
 ```bash
 node scripts/pm-scanner-daemon.cjs
 ```
 
-The daemon will:
+The PM daemon will:
 - Run every 10 seconds
-- Update `public/pm-signals.json` with fresh signals
-- Log activity to console
+- Read regime from `pm-market-regime.json`
+- Fetch PM bot events, OHLCV, and oracle prices
+- Update `public/pm-signals.json` with regime-adjusted signals
+- Log signal count to console
 
 ### Consume Signals
 
