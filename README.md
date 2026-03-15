@@ -35,7 +35,27 @@ This scanner generates trading signals specifically optimized for Polymarket bin
 - **Real-time Updates**: Scans every 10 seconds
 - **Multi-Coin Support**: BTC, ETH, SOL, XRP
 - **Multi-Timeframe**: 5m and 15m events
-- **Performance Target**: 55%+ win rate (achieved from initial 46%)
+- **Performance Target**: 65%+ win rate (v3 with velocity projection)
+
+## Version History
+
+### v3 (Current) - Pyth Oracle + Velocity Projection
+- **Pyth Network Oracle**: Sub-second price data, no rate limits
+- **Price Velocity Projection**: 30s/60s/120s momentum tracking
+- **Optimal Entry Timing**: Sweet spot 120-180s before settlement
+- **Lower thresholds**: 0.20%/0.08% oracle edge (Pyth accuracy)
+- **Dual edge strategy**: Oracle convergence + velocity confirmation
+
+### v2 - Market Regime Weighting
+- Oracle gap as primary signal (30 pts)
+- Regime as weight (not hard gate)
+- RANGING can trade with penalty
+- Faster TA: EMA 3/8, RSI-6
+
+### v1 - Initial Release
+- Hard regime gates (RANGING blocked)
+- CoinGecko only
+- Static TA lookbacks
 
 ## Architecture
 
