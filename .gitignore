@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.env
+.env.local
+public/pm-signals.json
+public/pm-market-regime.json
+dist/
+build/
+.next/

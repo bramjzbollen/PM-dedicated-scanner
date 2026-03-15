@@ -1,0 +1,32 @@
+{
+  "name": "pm-dedicated-scanner",
+  "version": "1.0.0",
+  "description": "Polymarket-specific trading signal scanner with regime-aware confidence scoring",
+  "main": "scripts/pm-scanner-daemon.cjs",
+  "scripts": {
+    "start": "node scripts/pm-scanner-daemon.cjs",
+    "dev": "node scripts/pm-scanner-daemon.cjs",
+    "build": "tsc"
+  },
+  "keywords": [
+    "polymarket",
+    "trading",
+    "scanner",
+    "signals",
+    "crypto",
+    "regime-detection"
+  ],
+  "author": "Bram Bollen",
+  "license": "MIT",
+  "dependencies": {
+    "ccxt": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/brambollen/PM-dedicated-scanner.git"
+  }
+}
