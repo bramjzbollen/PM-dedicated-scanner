@@ -15,15 +15,16 @@ node_modules/
 
 # Misc
 .DS_Store
-*.pem
 
 # Debug
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+*.log
 
 # Local env files
 .env
+.env.local
 .env*.local
 .env.production
 
@@ -34,26 +35,27 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# Logs
-*.log
-scanner-output.log
-
 # Secrets & credentials
 *.key
 *.pem
 *-credentials.json
 
-# State files with potentially sensitive data
-../trade-state/
+# State files (runtime data)
+trade-state/
 public/pm-bot-*.json
 public/v2-*.json
 public/market-regime.json
 public/scanner-config.json
 
-# Temp files
+# Temp / backup files
 *.tmp
 .tmp-*
 temp-*
+*.backup-*
+*.pre-*
 
 # OS
 Thumbs.db
+
+# Claude session files
+.claude/

@@ -16,11 +16,11 @@ const path = require('path');
 
 const OUTPUT_SCALP = path.join(__dirname, '..', 'public', 'v2-scalp-signals.json');
 const OUTPUT_SWING = path.join(__dirname, '..', 'public', 'v2-swing-signals.json');
-const WRITE_INTERVAL = 10 * 1000;
+const WRITE_INTERVAL = 5 * 1000; // 5s voor stabielere feed
 const LOG_INTERVAL = 60 * 1000;
 const MAX_CANDLES = 250; // Need more for EMA200 on 1h
-const TOP_PAIRS = 35;  // Conservative for stability under API/load spikes
-const ALL_PAIRS_MAX = 80;  // Conservative for stability under API/load spikes
+const TOP_PAIRS = 250;  // Increased from 35 for more trading opportunities
+const ALL_PAIRS_MAX = 250;  // Increased from 80 for more coverage
 const FETCH_RETRIES = 3;
 const FETCH_RETRY_DELAY_MS = 900;
 
@@ -264,26 +264,7 @@ function updateMarketRegime() {
 }
 function getRegime() { return _regimeData; }
 
-function calcStochRSI(closes, rsiPeriod, stochPeriod, kSmooth, dSmooth) {
-  if (closes.length < rsiPeriod + stochPeriod + kSmooth + dSmooth) return null;
-  const rsiValues = [];
-  let avgGain = 0, avgLoss = 0;
-  for (let i = 1; i <= rsiPeriod; i++) { const ch = closes[i] - closes[i-1]; if (ch > 0) avgGain += ch; else avgLoss -= ch; }
-  avgGain /= rsiPeriod; avgLoss /= rsiPeriod;
-  rsiValues.push(avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss));
-  for (let i = rsiPeriod + 1; i < closes.length; i++) { const ch = closes[i] - closes[i-1]; avgGain = (avgGain*(rsiPeriod-1) + (ch>0?ch:0)) / rsiPeriod; avgLoss = (avgLoss*(rsiPeriod-1) + (ch<0?-ch:0)) / rsiPeriod; rsiValues.push(avgLoss === 0 ? 100 : 100 - 100/(1+avgGain/avgLoss)); }
-  if (rsiValues.length < stochPeriod) return null;
-  const stochRaw = [];
-  for (let i = stochPeriod-1; i < rsiValues.length; i++) { const sl = rsiValues.slice(i-stochPeriod+1,i+1); const lo=Math.min(...sl),hi=Math.max(...sl); stochRaw.push(hi===lo?50:((rsiValues[i]-lo)/(hi-lo))*100); }
-  if (stochRaw.length < kSmooth) return null;
-  const kValues = [];
-  for (let i = kSmooth-1; i < stochRaw.length; i++) { let s=0; for(let j=i-kSmooth+1;j<=i;j++) s+=stochRaw[j]; kValues.push(s/kSmooth); }
-  if (kValues.length < dSmooth+1) return null;
-  const dValues = [];
-  for (let i = dSmooth-1; i < kValues.length; i++) { let s=0; for(let j=i-dSmooth+1;j<=i;j++) s+=kValues[j]; dValues.push(s/dSmooth); }
-  if (dValues.length < 2) return null;
-  return { k:kValues[kValues.length-1], kPrev:kValues[kValues.length-2], d:dValues[dValues.length-1], dPrev:dValues[dValues.length-2] };
-}
+// (duplicate calcStochRSI removed — using the one defined at line 126)
 
 function scan1m(symbol) {
   loadScannerConfig();
@@ -312,17 +293,35 @@ function scan1m(symbol) {
   const volSpike=volRatio>=sc.volume.spikeThreshold;
   const atr=calcATR(h,l,c,sc.atr.period);
   const atrPct=(atr/price)*100;
+  // Multi-timeframe: 5m EMA50 trend confirmation
+  const d5m = getCandles(symbol, '5m');
+  let htfBull = true, htfBear = true, htfTag = '';
+  if (d5m && d5m.closes.length >= 55) {
+    const ema50_5m = calcEMA(d5m.closes, 50);
+    if (ema50_5m.length > 0) {
+      const e50_5m = ema50_5m[ema50_5m.length - 1];
+      const px5m = d5m.closes[d5m.closes.length - 1];
+      htfBull = px5m > e50_5m;
+      htfBear = px5m < e50_5m;
+      htfTag = '5m' + (htfBull ? '↑' : htfBear ? '↓' : '~');
+    }
+  }
+  // Volume penalty: reduce confidence when volume is below average (low-conviction entry)
+  const volWeak = volRatio < 0.8;
+
   let signal='NEUTRAL',direction='NEUTRAL',confidence=0,reason='';
-  const longSignal = kCrossAboveD && inOversold && getRegime().longEnabled;  // V13: regime-gated
-  const shortSignal = kCrossBelowD && inOverbought && getRegime().shortEnabled;  // V13: regime-gated shorts
+  const longSignal = kCrossAboveD && inOversold && getRegime().longEnabled && htfBull;  // V14: regime + 5m HTF gate
+  const shortSignal = kCrossBelowD && inOverbought && getRegime().shortEnabled && htfBear;  // V14: regime + 5m HTF gate
   if (longSignal) {
     signal='LONG'; direction='LONG'; confidence=60;
     if(volSpike) confidence+=10; if(k<sc.entryZones.oversoldThreshold) confidence+=10; if(emaFv>emaSv&&emaSv>emaTv) confidence+=5;
-    reason=['StochRSI K='+k.toFixed(0)+' xD='+d.toFixed(0),'EMA '+sc.ema.fast+'>'+sc.ema.slow+' P>'+sc.ema.trend,volSpike?'Vol '+volRatio.toFixed(1)+'x':null,'ATR '+atrPct.toFixed(2)+'%'].filter(Boolean).join(' | ');
+    if(volWeak) confidence-=5; // Low volume penalty
+    reason=['StochRSI K='+k.toFixed(0)+' xD='+d.toFixed(0),'EMA '+sc.ema.fast+'>'+sc.ema.slow+' P>'+sc.ema.trend,htfTag,volSpike?'Vol '+volRatio.toFixed(1)+'x':volWeak?'VolLow '+volRatio.toFixed(1)+'x':null,'ATR '+atrPct.toFixed(2)+'%'].filter(Boolean).join(' | ');
   } else if (shortSignal) {
     signal='SHORT'; direction='SHORT'; confidence=60;
     if(volSpike) confidence+=10; if(k>sc.entryZones.overboughtThreshold) confidence+=10; if(emaFv<emaSv&&emaSv<emaTv) confidence+=5;
-    reason=['StochRSI K='+k.toFixed(0)+' xD='+d.toFixed(0),'EMA '+sc.ema.fast+'<'+sc.ema.slow+' P<'+sc.ema.trend,volSpike?'Vol '+volRatio.toFixed(1)+'x':null,'ATR '+atrPct.toFixed(2)+'%'].filter(Boolean).join(' | ');
+    if(volWeak) confidence-=5; // Low volume penalty
+    reason=['StochRSI K='+k.toFixed(0)+' xD='+d.toFixed(0),'EMA '+sc.ema.fast+'<'+sc.ema.slow+' P<'+sc.ema.trend,htfTag,volSpike?'Vol '+volRatio.toFixed(1)+'x':volWeak?'VolLow '+volRatio.toFixed(1)+'x':null,'ATR '+atrPct.toFixed(2)+'%'].filter(Boolean).join(' | ');
   }
   confidence=Math.min(95,confidence);
   let riskPerUnit=atr*sc.risk.slAtrMultiple;
@@ -340,8 +339,8 @@ function scan1m(symbol) {
 
 
 function scan15m(symbol) {
-  const d15=getCandles(symbol,'15m'), d1h=getCandles(symbol,'1h');
-  if(!d15||d15.closes.length<110||!d1h||d1h.closes.length<110) return null;
+  const d15=getCandles(symbol,'15m');
+  if(!d15||d15.closes.length<110) return null;
   const c=d15.closes,h=d15.highs,l=d15.lows,v=d15.volumes;
   const price=c[c.length-1];
   const ema21=calcEMA(c,21),ema50=calcEMA(c,50),ema100=calcEMA(c,100);
@@ -351,7 +350,8 @@ function scan15m(symbol) {
   const bearTrend=price<e21&&price<e50&&price<e100;
   const rsi=calcRSI(c,21); if(rsi.length<2) return null;
   const rsiVal=last(rsi);
-  const rsiBullOk=rsiVal>40&&rsiVal<60, rsiBearOk=rsiVal>40&&rsiVal<60;
+  // Asymmetric RSI: longs need pullback zone (35-55), shorts need overbought fade (45-65)
+  const rsiBullOk=rsiVal>35&&rsiVal<55, rsiBearOk=rsiVal>45&&rsiVal<65;
   const macd=calcMACD(c,8,17,9); if(macd.histogram.length<3) return null;
   const hist=last(macd.histogram), macdLine=last(macd.line), macdSig=last(macd.signal);
   const macdBull=macdLine>macdSig&&hist>0, macdBear=macdLine<macdSig&&hist<0;
@@ -361,27 +361,33 @@ function scan15m(symbol) {
   const avgVol=volSum/Math.min(20,volLen-volStart);
   const volRatio=avgVol>0?v[volLen-1]/avgVol:1;
   let signal='NEUTRAL',direction='NEUTRAL',confidence=0,reason='';
-  const longSignal=bullTrend&&rsiBullOk&&macdBull;
-  const shortSignal=false; // V9: 15m shorts disabled
+  // V14: regime-gated + shorts re-enabled with regime filter
+  const longSignal=bullTrend&&rsiBullOk&&macdBull&&getRegime().longEnabled;
+  const shortSignal=bearTrend&&rsiBearOk&&macdBear&&getRegime().shortEnabled;
   if(longSignal) {
     signal='LONG'; direction='LONG'; confidence=65;
-    if(e21>e50&&e50>e100) confidence+=10; if(volRatio>=1.3) confidence+=5; if(rsiVal>45&&rsiVal<55) confidence+=5;
-    reason=['P>EMA21>50>100','RSI='+rsiVal.toFixed(0),'MACD+ H='+hist.toFixed(4),volRatio>=1.3?'Vol '+volRatio.toFixed(1)+'x':null].filter(Boolean).join(' | ');
+    if(e21>e50&&e50>e100) confidence+=10; if(volRatio>=1.3) confidence+=5; if(rsiVal>40&&rsiVal<50) confidence+=5;
+    if(volRatio<0.8) confidence-=5; // Low volume penalty
+    reason=['P>EMA21>50>100','RSI='+rsiVal.toFixed(0),'MACD+ H='+hist.toFixed(4),volRatio>=1.3?'Vol '+volRatio.toFixed(1)+'x':volRatio<0.8?'VolLow '+volRatio.toFixed(1)+'x':null].filter(Boolean).join(' | ');
   } else if(shortSignal) {
     signal='SHORT'; direction='SHORT'; confidence=65;
-    if(e21<e50&&e50<e100) confidence+=10; if(volRatio>=1.3) confidence+=5; if(rsiVal>45&&rsiVal<55) confidence+=5;
-    reason=['P<EMA21<50<100','RSI='+rsiVal.toFixed(0),'MACD- H='+hist.toFixed(4),volRatio>=1.3?'Vol '+volRatio.toFixed(1)+'x':null].filter(Boolean).join(' | ');
+    if(e21<e50&&e50<e100) confidence+=10; if(volRatio>=1.3) confidence+=5; if(rsiVal>50&&rsiVal<60) confidence+=5;
+    if(volRatio<0.8) confidence-=5; // Low volume penalty
+    reason=['P<EMA21<50<100','RSI='+rsiVal.toFixed(0),'MACD- H='+hist.toFixed(4),volRatio>=1.3?'Vol '+volRatio.toFixed(1)+'x':volRatio<0.8?'VolLow '+volRatio.toFixed(1)+'x':null].filter(Boolean).join(' | ');
   }
-  confidence=Math.min(95,confidence);
+  confidence=Math.min(95,Math.max(0,confidence));
+  loadScannerConfig(); // Ensure fresh config for fee calc
+  const sc15 = scannerConfig;
+  const feePct = (sc15 && sc15.risk && sc15.risk.roundtripFeePct) || 0.11;
   const slBuffer=atr*0.5;
   let riskPerUnit=direction==='LONG'?Math.abs(price-(e21-slBuffer)):Math.abs((e21+slBuffer)-price);
   const minSl=price*0.005; if(riskPerUnit<minSl) riskPerUnit=minSl;
   const tpDist=riskPerUnit*3;
-  const minTpFees=price*(0.11/100)*2.5;
+  const minTpFees=price*(feePct/100)*2.5;
   const tpOk=tpDist>minTpFees;
   const skipTrade=signal==='NEUTRAL'||!tpOk;
   return { pair:symbol,symbol,signal,direction,confidence:Math.round(confidence), reason:skipTrade&&signal!=='NEUTRAL'?reason+' [SKIP: TP<fees]':reason, skipTrade, criteriaMet:(longSignal||shortSignal?3:0)+(volRatio>=1.3?1:0), criteriaTotal:4, criteriaDetails:{emaTrend:bullTrend||bearTrend,rsiOk:rsiBullOk||rsiBearOk,macdOk:macdBull||macdBear,volume:volRatio>=1.3},
-    trade:skipTrade?null:{ stopLoss:+(direction==='LONG'?e21-slBuffer:e21+slBuffer).toFixed(6), takeProfit:+(price+tpDist*(direction==='LONG'?1:-1)).toFixed(6), breakEvenAt:+(price+riskPerUnit*1.0*(direction==='LONG'?1:-1)).toFixed(6), riskR:+riskPerUnit.toFixed(6), feeCostPct:0.11, tpToFeeRatio:+(tpDist/(price*0.11/100)).toFixed(2), timeStopCandles:12 },
+    trade:skipTrade?null:{ stopLoss:+(direction==='LONG'?e21-slBuffer:e21+slBuffer).toFixed(6), takeProfit:+(price+tpDist*(direction==='LONG'?1:-1)).toFixed(6), breakEvenAt:+(price+riskPerUnit*1.0*(direction==='LONG'?1:-1)).toFixed(6), riskR:+riskPerUnit.toFixed(6), feeCostPct:feePct, tpToFeeRatio:+(tpDist/(price*feePct/100)).toFixed(2), timeStopCandles:12 },
     indicators:{ price:+price.toFixed(6), ema21:+e21.toFixed(6), ema50:+e50.toFixed(6), ema100:+e100.toFixed(6), rsi21:+rsiVal.toFixed(2), macdLine:+macdLine.toFixed(6), macdSignal:+macdSig.toFixed(6), macdHist:+hist.toFixed(6), volumeRatio:+volRatio.toFixed(2), atrPercent:+atrPct.toFixed(3), atr:+atr.toFixed(6) } };
 }
 
@@ -640,7 +646,7 @@ async function main() {
       })
       .filter(p => p.volume >= 50000)
       .sort((a, b) => b.volume - a.volume)
-      .filter(p => p.volume >= 10_000_000);
+      .filter(p => p.volume >= 1_000_000);  // $1M min volume (was $10M - too restrictive)
 
     topPairNames = usdtPairs.slice(0, TOP_PAIRS).map(p => p.symbol);
     allPairNames = usdtPairs.slice(0, ALL_PAIRS_MAX).map(p => p.symbol);
@@ -703,6 +709,20 @@ async function main() {
     if (cleaned > 0) console.log('[V2] Cleaned ' + cleaned + ' stale candle sets');
     if (global.gc) global.gc();
   }, 30 * 60 * 1000);
+
+  // Heartbeat: update timestamp every 3s to prevent stale detection
+  setInterval(() => {
+    try {
+      const scalpPath = OUTPUT_SCALP;
+      if (fs.existsSync(scalpPath)) {
+        const data = JSON.parse(fs.readFileSync(scalpPath, 'utf8'));
+        data.timestamp = new Date().toISOString();
+        safeWriteJsonAtomic(scalpPath, data);
+      }
+    } catch (e) {
+      console.warn('[V2-heartbeat] Failed to update timestamp:', e.message);
+    }
+  }, 3000);
 
   console.log('=== V2 Continuation Scanner running ===');
 }

@@ -476,9 +476,11 @@ function resolveRegimeState(state: TradeState): TradeState {
   }
 
   const fallback = state.regimeConfig.fallbackOnMissingData;
+  // allow-all: treat as neutral but mark source so processSignals can skip all regime gates
+  // block-all: treat as bearish (blocks longs) — processSignals line 816 also hard-blocks everything
+  // neutral: standard neutral with throttling
   let fallbackStatus: RegimeState['status'] = 'neutral';
-  if (fallback === 'allow-all') fallbackStatus = 'neutral';
-  if (fallback === 'block-all') fallbackStatus = 'neutral';
+  if (fallback === 'block-all') fallbackStatus = 'bearish';
 
   return {
     ...state,
@@ -504,12 +506,12 @@ export function createPosition(
   const quantity = effectiveSize / entryPriceFilled;
   let stopLoss: number, takeProfit: number;
   const isSwing = state.mode.includes('swing');
-  const MIN_SL_PCT = isSwing ? 0.010 : 0.010; // HFT: min 1.0% SL for both
+  const MIN_SL_PCT = isSwing ? 0.010 : 0.008; // Min SL: 1.0% swing, 0.8% scalp (matches config defaults)
 
-  if (state.mode === 'v2-grid' && trade && trade.stopLoss > 0 && trade.takeProfit > 0 && trade.riskR > 0) { // V7b: grid uses trade TP/SL, scalp uses config
+  if (trade && trade.stopLoss > 0 && trade.takeProfit > 0 && trade.riskR > 0) { // Use scanner ATR-based SL/TP for all modes when available
     stopLoss = trade.stopLoss;
     takeProfit = trade.isStrongSetup && trade.takeProfitStrong ? trade.takeProfitStrong : trade.takeProfit;
-    
+
     // Enforce minimum SL distance even with scanner-provided values
     const slDistance = Math.abs(entryPriceFilled - stopLoss);
     const minSlDistance = entryPriceFilled * MIN_SL_PCT;
@@ -548,7 +550,9 @@ export function closePosition(state: TradeState, posId: string, reason: string, 
   const duration = Date.now() - new Date(pos.openedAt).getTime();
   const isWin = totalPnl > 0;
 
-  const isNearFlat = Math.abs(totalPnl) < 0.01 || Math.abs(exitPriceFilled - pos.entryPrice) <= (pos.entryPrice * 0.00005);
+  // Breakeven tolerance: account for entry/exit slippage (2+2 bps) + taker fees (10 bps) = ~14 bps total
+  const beTolerance = pos.entryPrice * 0.0015; // 15 bps tolerance
+  const isNearFlat = Math.abs(totalPnl) < 0.05 || Math.abs(exitPriceFilled - pos.entryPrice) <= beTolerance;
   const effectiveReason: ServerPosition['closeReason'] =
     reason === 'sl' && isNearFlat && (pos._breakEvenApplied || Math.abs(pos.stopLoss - pos.entryPrice) <= (pos.entryPrice * 0.0001))
       ? 'breakeven'
@@ -679,16 +683,23 @@ export function updatePricesAndCheckExits(state: TradeState, prices: Record<stri
         const reachedBE = isLong ? price >= updated._breakEvenAt : price <= updated._breakEvenAt;
         if (reachedBE) { updated.stopLoss = updated.entryPrice; updated._breakEvenApplied = true; }
       }
-      // Time stop
+      // Enhanced time stop: sliding threshold — the longer a position is held past time stop,
+      // the HIGHER the profit threshold required to keep it open.
+      // At 1x timeStopCandles: need 0.5R to stay open
+      // At 1.5x: need 0.75R
+      // At 2x+: close unconditionally (position is dead weight)
       const candleDurationMs = isSwing ? 15 * 60 * 1000 : 60 * 1000;
       const timeStopMs = (updated._timeStopCandles || (isSwing ? 8 : 6)) * candleDurationMs;
       if (posAge >= timeStopMs) {
         const pct = isLong
           ? ((price - updated.entryPrice) / updated.entryPrice) * 100
           : ((updated.entryPrice - price) / updated.entryPrice) * 100;
-        const halfRPct = updated._riskR && updated._riskR > 0
-          ? ((updated._riskR * 0.5) / updated.entryPrice) * 100 : 0.2;
-        if (pct < halfRPct) { toClose.push({ id: pos.id, reason: 'timeout', price }); return updated; }
+        const ageRatio = Math.min(2, posAge / timeStopMs); // 1.0 at threshold, 2.0 at 2x
+        const rPctBase = updated._riskR && updated._riskR > 0
+          ? ((updated._riskR) / updated.entryPrice) * 100 : 0.4;
+        // Sliding: 0.5R at 1x, 0.75R at 1.5x, unconditional close at 2x
+        const requiredPct = ageRatio >= 2 ? Infinity : rPctBase * (0.25 + 0.25 * ageRatio);
+        if (pct < requiredPct) { toClose.push({ id: pos.id, reason: 'timeout', price }); return updated; }
       }
       // Trailing activation
       if (!updated.trailingActivated) {
@@ -721,14 +732,25 @@ export function processSignals(
   if (!state.isRunning || !state.config.autoEntry) return state;
 
   const cfg = state.config;
+
+  // Daily loss guard: stop opening new positions when daily realized loss exceeds threshold
+  // Uses walletBalance drawdown from initialWalletSize as proxy for daily loss
+  const dailyLossLimitPct = 5; // 5% of wallet = hard stop
+  const dailyLossLimitUsd = state.initialWalletSize * (dailyLossLimitPct / 100);
+  const currentDrawdown = state.initialWalletSize - state.stats.walletBalance;
+  if (currentDrawdown >= dailyLossLimitUsd && state.stats.closedCount > 0) {
+    return state; // Breaker tripped: no new entries until reset
+  }
   const effectiveMax = getEffectiveMaxPositions(state.stats.walletBalance, cfg.positionSize, cfg.maxPositions);
   let newState = resolveRegimeState({ ...state, signalLatches: { ...(state.signalLatches || {}) } });
   const regimeCfg = newState.regimeConfig || DEFAULT_REGIME_CONFIG;
   const regime = newState.regimeState?.status || 'neutral';
   const signalFirst = regimeCfg.filterMode === 'signal-first';
-  const applyDirectionalRegimeBlock = regimeCfg.enabled && state.mode === 'v2-scalping' && (!signalFirst || regimeCfg.signalFirstDirectionalBlock);
-  const applyNeutralThrottle = regimeCfg.enabled && state.mode === 'v2-scalping' && !signalFirst;
-  const neutralConfidenceUplift = (regimeCfg.enabled && state.mode === 'v2-scalping' && !signalFirst)
+  // allow-all fallback: bypass ALL regime gates (directional block, neutral throttle, confidence uplift)
+  const isFallbackAllowAll = newState.regimeState?.source === 'fallback' && regimeCfg.fallbackOnMissingData === 'allow-all';
+  const applyDirectionalRegimeBlock = !isFallbackAllowAll && regimeCfg.enabled && state.mode === 'v2-scalping' && (!signalFirst || regimeCfg.signalFirstDirectionalBlock);
+  const applyNeutralThrottle = !isFallbackAllowAll && regimeCfg.enabled && state.mode === 'v2-scalping' && !signalFirst;
+  const neutralConfidenceUplift = (!isFallbackAllowAll && regimeCfg.enabled && state.mode === 'v2-scalping' && !signalFirst)
     ? Math.max(0, regimeCfg.neutralConfidenceUplift || 0)
     : 0;
   const applyCooldown = !(signalFirst && regimeCfg.signalFirstDisableCooldown);

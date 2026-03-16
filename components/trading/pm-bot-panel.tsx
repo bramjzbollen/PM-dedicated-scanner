@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
+import { PMEventCard } from './pm-event-card';
 
 type PMEventConfig = {
   symbol: string;
@@ -23,6 +24,42 @@ type PMConfig = {
   events: PMEventConfig[];
 };
 
+// V4 Scanner signal (from pm-signals.json)
+type V4Signal = {
+  event: string;
+  symbol: string;
+  marketKey: string;
+  timeframeMinutes: number;
+  side: 'UP' | 'DOWN' | null;
+  confidence: number;
+  reason: string;
+  skipTrade: boolean;
+  edge?: number;
+  pmOdds?: { up: number; down: number };
+  pmSpread?: number;
+  kelly?: { fullKellyPct: number; recommendedPct: number; edge: number; worthBetting: boolean };
+  oraclePrice?: number;
+  bybitPrice?: number;
+  timeToSettle?: number;
+  trend?: string;
+  momentum?: number;
+  volatility?: number;
+  velocity?: { direction: string; strength: number; projected: number };
+  flashCrash?: any;
+  probUp?: number;
+  probDown?: number;
+};
+type V4Feed = { timestamp: string; version: string; regime: string; regimeConfidence: number; signals: V4Signal[]; ageMs?: number; stale?: boolean };
+
+type WalletBalance = {
+  ok: boolean;
+  balanceUsd: number;
+  address: string;
+  cached: boolean;
+  fetchedAt: string;
+  error?: string;
+};
+
 type PMRuntime = {
   timestamp: string;
   ageMs: number;
@@ -36,6 +73,7 @@ type PMRuntime = {
   paperModeOnly: boolean;
   sourceLabel: string;
   roadmapTag: string;
+  walletBalance?: WalletBalance;
   events: Array<{
     symbol: string;
     marketKey: string;
@@ -55,6 +93,12 @@ type PMRuntime = {
     winRatePct: number;
     totalPnlUsd: number;
     todayPnlUsd: number;
+    paperPnlUsd: number;
+    livePnlUsd: number;
+    paperWins: number;
+    liveWins: number;
+    paperLosses: number;
+    liveLosses: number;
   };
 };
 
@@ -71,6 +115,7 @@ type PMBet = {
   openedAt: string;
   settleAt: string;
   status: 'open' | 'closed';
+  execution?: 'paper' | 'live';
   exit?: 'WIN' | 'LOSS';
   exitPrice?: number;
   pnlUsd?: number;
@@ -260,6 +305,59 @@ export function PMBotPanel() {
   const [baselineConfig, setBaselineConfig] = useState<PMConfig | null>(null);
   const [runtime, setRuntime] = useState<PMRuntime | null>(null);
   const [openBets, setOpenBets] = useState<PMBet[]>([]);
+  // V4 scanner signals (live PM odds + edge)
+  const [v4Signals, setV4Signals] = useState<V4Signal[]>([]);
+  const [v4Regime, setV4Regime] = useState<string>('');
+
+  useEffect(() => {
+    let cancelled = false;
+    const fetchV4 = async () => {
+      try {
+        const res = await fetch('/api/pm-bot/signals', { cache: 'no-store' });
+        if (!res.ok) return;
+        const data: V4Feed = await res.json();
+        if (!cancelled && data.signals) {
+          setV4Signals(data.signals);
+          setV4Regime(data.regime || '');
+        }
+      } catch { /* silent */ }
+    };
+    fetchV4();
+    const id = setInterval(fetchV4, 10_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+
+  // Map v4 signals by marketKey for quick lookup
+  const v4ByKey = useMemo(() => {
+    const map = new Map<string, V4Signal>();
+    for (const s of v4Signals) map.set(s.marketKey, s);
+    return map;
+  }, [v4Signals]);
+
+  // Market filters
+  const [filterTimeframes, setFilterTimeframes] = useState<Set<number>>(new Set([5, 15]));
+  const [filterPairs, setFilterPairs] = useState<Set<string>>(new Set(['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT']));
+
+  const allPairs = useMemo(() => {
+    const pairs = new Set<string>();
+    (runtime?.events || []).forEach((e: any) => { if (e.symbol) pairs.add(e.symbol); });
+    return [...pairs].sort();
+  }, [runtime]);
+
+  const allTimeframes = useMemo(() => {
+    const tfs = new Set<number>();
+    (config?.events || []).forEach((e: any) => { if (e.timeframeMinutes) tfs.add(e.timeframeMinutes); });
+    return [...tfs].sort((a, b) => a - b);
+  }, [config]);
+
+  const filteredEvents = useMemo(() => {
+    return (runtime?.events || []).filter((e: any) => {
+      const cfg = config?.events?.find((x: any) => x.marketKey === e.marketKey);
+      return filterPairs.has(e.symbol) && filterTimeframes.has(cfg?.timeframeMinutes ?? 5);
+    });
+  }, [runtime, config, filterPairs, filterTimeframes]);
+
+  const [collapsedEvents, setCollapsedEvents] = useState<Record<string, boolean>>({});
   const [history, setHistory] = useState<PMBet[]>([]);
   const [saving, setSaving] = useState(false);
 
@@ -402,7 +500,7 @@ export function PMBotPanel() {
   const runtimeAgeMs = Number.isFinite(runtime?.feedAgeMs as number)
     ? Number(runtime?.feedAgeMs)
     : Number(runtime?.ageMs || 0);
-  const isRuntimeStale = Boolean(runtime?.stale) || runtimeAgeMs > 3000;
+  const isRuntimeStale = Boolean(runtime?.stale) || runtimeAgeMs > 30000;
   const executionStatus = runtime?.executionStatus || (runtime?.mode === 'live' ? 'LIVE' : 'PAPER');
   const isBlocked = executionStatus === 'BLOCKED';
   const modeBadgeClass = executionStatus === 'LIVE'
@@ -475,6 +573,49 @@ export function PMBotPanel() {
             <Badge variant="outline" className="text-amber-200 border-amber-500/30">{runtime.roadmapTag}</Badge>
           </div>
 
+          {/* Wallet Balance Banner */}
+          {runtime.walletBalance && (
+            <div className={cn(
+              'mb-3 rounded-lg border px-3 py-2.5 flex items-center justify-between gap-3',
+              runtime.walletBalance.ok
+                ? runtime.walletBalance.balanceUsd < (config?.paperBetSizeUsd ?? 25)
+                  ? 'border-amber-500/40 bg-amber-500/10'
+                  : 'border-emerald-500/30 bg-emerald-500/8'
+                : 'border-rose-500/30 bg-rose-500/8'
+            )}>
+              <div className="flex items-center gap-2.5">
+                <div className="text-[10px] uppercase tracking-wider text-white/40">Wallet</div>
+                <div className={cn(
+                  'text-xl font-bold font-mono',
+                  runtime.walletBalance.ok
+                    ? runtime.walletBalance.balanceUsd < (config?.paperBetSizeUsd ?? 25)
+                      ? 'text-amber-300'
+                      : 'text-emerald-300'
+                    : 'text-rose-300'
+                )}>
+                  {runtime.walletBalance.ok
+                    ? `$${runtime.walletBalance.balanceUsd.toFixed(2)}`
+                    : '—'
+                  }
+                </div>
+                <span className="text-[10px] text-white/40">USDC</span>
+              </div>
+              <div className="flex flex-col items-end gap-1">
+                {runtime.walletBalance.cached && (
+                  <Badge variant="outline" className="text-[9px] border-white/15 text-white/45">cached</Badge>
+                )}
+                {runtime.walletBalance.error && (
+                  <span className="text-[10px] text-rose-300 max-w-[160px] truncate">{runtime.walletBalance.error}</span>
+                )}
+                {runtime.walletBalance.ok && runtime.walletBalance.balanceUsd < (config?.paperBetSizeUsd ?? 25) && (
+                  <Badge variant="outline" className="text-[9px] border-amber-500/35 text-amber-200 bg-amber-500/10">
+                    LOW — live orders blocked
+                  </Badge>
+                )}
+              </div>
+            </div>
+          )}
+
           <div className={cn('mb-3 rounded-lg border px-2.5 py-2 text-[11px]', isBlocked ? 'border-rose-500/40 bg-rose-500/10 text-rose-100' : executionStatus === 'LIVE' ? 'border-emerald-500/35 bg-emerald-500/10 text-emerald-100' : 'border-cyan-500/30 bg-cyan-500/10 text-cyan-100')}>
             <span className="font-semibold">{executionStatus}</span> — {runtime.statusReason || 'Geen reden beschikbaar'}
           </div>
@@ -485,24 +626,39 @@ export function PMBotPanel() {
             </Badge>
             {isRuntimeStale && (
               <Badge variant="outline" className="border-rose-500/40 text-rose-200 bg-rose-500/10">
-                STALE &gt; 3000ms — actions tijdelijk geblokkeerd
+                STALE &gt; 30s — actions tijdelijk geblokkeerd
               </Badge>
             )}
           </div>
 
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
             <div className="p-3 rounded-xl bg-white/[0.02] border border-white/[0.06]">
-              <div className="text-[10px] uppercase tracking-wider text-white/30">Open Bets</div>
+              <div className="text-[10px] uppercase tracking-wider text-white/30">Open</div>
               <div className="text-xl font-bold font-mono text-cyan-300">{runtime.stats?.openBets ?? 0}</div>
+            </div>
+            <div className="p-3 rounded-xl bg-white/[0.02] border border-white/[0.06]">
+              <div className="text-[10px] uppercase tracking-wider text-white/30">Settled</div>
+              <div className="text-xl font-bold font-mono text-white/80">{runtime.stats?.closedBets ?? 0}</div>
+              <div className="text-[9px] text-white/40 mt-0.5">
+                <span className="text-emerald-400">{runtime.stats?.wins ?? 0}W</span>
+                {' / '}
+                <span className="text-rose-400">{runtime.stats?.losses ?? 0}L</span>
+              </div>
             </div>
             <div className="p-3 rounded-xl bg-white/[0.02] border border-white/[0.06]">
               <div className="text-[10px] uppercase tracking-wider text-white/30">Winrate</div>
               <div className="text-xl font-bold font-mono text-white/90">{(runtime.stats?.winRatePct ?? 0).toFixed(1)}%</div>
             </div>
             <div className="p-3 rounded-xl bg-white/[0.02] border border-white/[0.06]">
-              <div className="text-[10px] uppercase tracking-wider text-white/30">Vandaag PnL</div>
-              <div className={cn('text-xl font-bold font-mono', (runtime.stats?.todayPnlUsd ?? 0) >= 0 ? 'text-emerald-300' : 'text-rose-300')}>
-                ${(runtime.stats?.todayPnlUsd ?? 0).toFixed(2)}
+              <div className="text-[10px] uppercase tracking-wider text-cyan-400/50">Paper PnL</div>
+              <div className={cn('text-xl font-bold font-mono', (runtime.stats?.paperPnlUsd ?? 0) >= 0 ? 'text-emerald-300' : 'text-rose-300')}>
+                ${(runtime.stats?.paperPnlUsd ?? 0).toFixed(2)}
+              </div>
+            </div>
+            <div className="p-3 rounded-xl bg-white/[0.02] border border-emerald-500/20">
+              <div className="text-[10px] uppercase tracking-wider text-emerald-400/70">Live PnL</div>
+              <div className={cn('text-xl font-bold font-mono', (runtime.stats?.livePnlUsd ?? 0) >= 0 ? 'text-emerald-300' : 'text-rose-300')}>
+                ${(runtime.stats?.livePnlUsd ?? 0).toFixed(2)}
               </div>
             </div>
             <div className="p-3 rounded-xl bg-white/[0.02] border border-white/[0.06]">
@@ -608,7 +764,7 @@ export function PMBotPanel() {
                 Kill-switch → PAPER
               </button>
             </div>
-            <div className="text-[11px] text-white/55">Live wordt alleen geactiveerd als preflight critical checks + freshness (≤3000ms) + geoblock PASS server-side slagen.</div>
+            <div className="text-[11px] text-white/55">Live wordt alleen geactiveerd als preflight critical checks + freshness (≤30000ms) + geoblock PASS server-side slagen.</div>
           </div>
 
           <div className="rounded-xl border border-white/[0.1] bg-black/20 p-3 space-y-3">
@@ -691,168 +847,179 @@ export function PMBotPanel() {
         )}
       </Card>
 
-      <Card className="border-violet-500/[0.1]">
+      <Card className="border-white/[0.08]">
+        <CardHeader className="pb-3">
+          <div className="flex items-center gap-2">
+              <CardTitle className="text-sm text-white/90">Markets</CardTitle>
+              {v4Regime && (
+                <span className={cn(
+                  'text-[9px] font-semibold px-1.5 py-0.5 rounded-md border',
+                  v4Regime === 'BULLISH' ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' :
+                  v4Regime === 'BEARISH' ? 'border-rose-500/40 bg-rose-500/15 text-rose-300' :
+                  'border-white/20 bg-white/[0.04] text-white/60'
+                )}>
+                  {v4Regime}
+                </span>
+              )}
+            </div>
+        </CardHeader>
+        <CardContent>
+          {/* Filter bar */}
+          <div className="flex flex-wrap items-center gap-3 mb-4">
+            <div className="flex items-center gap-1.5">
+              <span className="text-[9px] uppercase tracking-wider text-white/30">TF</span>
+              {allTimeframes.map((tf: number) => (
+                <button
+                  key={tf}
+                  type="button"
+                  onClick={() => setFilterTimeframes(prev => {
+                    const next = new Set(prev);
+                    next.has(tf) ? next.delete(tf) : next.add(tf);
+                    return next;
+                  })}
+                  className={cn(
+                    'px-2.5 py-1 rounded-lg border text-[10px] font-medium transition-all',
+                    filterTimeframes.has(tf)
+                      ? 'border-violet-500/40 bg-violet-500/15 text-violet-300'
+                      : 'border-white/10 bg-white/[0.02] text-white/30 hover:text-white/50'
+                  )}
+                >
+                  {tf < 60 ? tf + 'm' : (tf / 60) + 'h'}
+                </button>
+              ))}
+            </div>
+            <div className="w-px h-4 bg-white/[0.08]" />
+            <div className="flex items-center gap-1.5">
+              <span className="text-[9px] uppercase tracking-wider text-white/30">Pairs</span>
+              {allPairs.map((pair: string) => (
+                <button
+                  key={pair}
+                  type="button"
+                  onClick={() => setFilterPairs(prev => {
+                    const next = new Set(prev);
+                    next.has(pair) ? next.delete(pair) : next.add(pair);
+                    return next;
+                  })}
+                  className={cn(
+                    'px-2.5 py-1 rounded-lg border text-[10px] font-medium transition-all',
+                    filterPairs.has(pair)
+                      ? 'border-cyan-500/35 bg-cyan-500/10 text-cyan-300'
+                      : 'border-white/10 bg-white/[0.02] text-white/30 hover:text-white/50'
+                  )}
+                >
+                  {pair.replace('/USDT', '')}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+            {filteredEvents.map((e: any) => {
+              const cfg = config.events.find((x) => x.marketKey === e.marketKey);
+              const v4 = v4ByKey.get(e.marketKey);
+              const timeframe = formatTimeframe(cfg?.timeframeMinutes ?? 60);
+              return (
+                <PMEventCard
+                  key={e.marketKey}
+                  event={e}
+                  v4={v4}
+                  enabled={cfg?.enabled ?? false}
+                  stale={isRuntimeStale}
+                  timeframe={timeframe}
+                  sparkline={<EventSparkline points={decisionSeriesByMarket[e.marketKey]} />}
+                  onToggle={() => setConfig({
+                    ...config,
+                    events: config.events.map((x) => x.marketKey === e.marketKey ? { ...x, enabled: !x.enabled } : x),
+                  })}
+                  onRemove={() => setConfig({
+                    ...config,
+                    events: config.events.filter((x) => x.marketKey !== e.marketKey),
+                  })}
+                />
+              );
+            })}
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="border-white/[0.08]">
         <CardHeader className="pb-3">
           <div className="flex items-center justify-between gap-2">
-            <CardTitle className="text-sm text-white/90">Suggested Markets</CardTitle>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={loadSuggestedMarkets}
-                className="px-3 py-1.5 rounded-lg text-xs border border-cyan-500/30 bg-cyan-500/15 text-cyan-200"
-                disabled={loadingSuggested}
-              >
-                {loadingSuggested ? 'Refreshing…' : 'Refresh'}
-              </button>
-              <button
-                type="button"
-                onClick={addSelectedToMapping}
-                className="px-3 py-1.5 rounded-lg text-xs border border-emerald-500/30 bg-emerald-500/15 text-emerald-200"
-                disabled={activeSuggestedCount === 0 || isRuntimeStale}
-              >
-                Add selected ({activeSuggestedCount})
-              </button>
+            <CardTitle className="text-sm text-white/90">Active trades</CardTitle>
+            <div className="flex items-center gap-2 text-[10px]">
+              <Badge variant="outline" className="border-cyan-500/30 text-cyan-200 bg-cyan-500/10">
+                Paper: {openBets.filter(b => b.execution === 'paper' || !b.execution).length}
+              </Badge>
+              <Badge variant="outline" className="border-emerald-500/35 text-emerald-200 bg-emerald-500/15">
+                Live: {openBets.filter(b => b.execution === 'live').length}
+              </Badge>
             </div>
           </div>
         </CardHeader>
         <CardContent>
-          {suggestedError && <div className="text-xs text-rose-300 mb-2">{suggestedError}</div>}
-          <div className="space-y-2 max-h-[280px] overflow-auto pr-1">
-            {suggestedMarkets.map((m) => (
-              <label key={m.id} className="rounded-lg border border-white/[0.1] bg-white/[0.02] p-3 flex items-start gap-3">
-                <input
-                  type="checkbox"
-                  checked={!!selectedSuggested[m.id]}
-                  onChange={(e) => setSelectedSuggested((prev) => ({ ...prev, [m.id]: e.target.checked }))}
-                  className="mt-0.5"
-                />
-                <div className="min-w-0 flex-1">
-                  <div className="text-sm text-white font-medium">{m.label}</div>
-                  <div className="text-[11px] text-white/50 truncate">{m.question || m.slug || m.marketKey}</div>
-                  <div className="mt-1 flex flex-wrap gap-1.5">
-                    <Badge variant="outline" className="text-[10px] border-cyan-500/30 text-cyan-200">{formatTimeframe(m.timeframeMinutes)}</Badge>
-                    <Badge variant="outline" className="text-[10px] border-violet-500/30 text-violet-200">{m.symbol}</Badge>
-                    {typeof m.volumeNum === 'number' && <Badge variant="outline" className="text-[10px] border-white/20 text-white/70">Vol ${Math.round(m.volumeNum).toLocaleString()}</Badge>}
-                  </div>
-                </div>
-              </label>
-            ))}
-            {!loadingSuggested && suggestedMarkets.length === 0 && <div className="text-sm text-white/40">Geen extra suggesties gevonden.</div>}
-          </div>
-        </CardContent>
-      </Card>
-
-      <Card className="border-white/[0.08]">
-        <CardHeader className="pb-3">
-          <CardTitle className="text-sm text-white/90">Event mapping + signal status</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
-            {(runtime.events || []).map((e) => {
-              const cfg = config.events.find((x) => x.marketKey === e.marketKey);
-              const timeframe = formatTimeframe(cfg?.timeframeMinutes ?? 60);
-              const isOpen = Boolean(e.activeBetId && e.countdownSec > 0);
-              const isClosing = isOpen && e.countdownSec <= 120;
-              const statusLabel = isOpen ? (isClosing ? 'CLOSING' : 'OPEN') : (e.confidence > 0 ? 'SETTLED' : 'IDLE');
-              const statusClass = isOpen
-                ? (isClosing ? 'border-amber-500/40 text-amber-200' : 'border-emerald-500/40 text-emerald-200')
-                : e.confidence > 0
-                  ? 'border-cyan-500/30 text-cyan-200'
-                  : 'border-white/20 text-white/60';
-
-              return (
-                <div key={e.marketKey} className="rounded-xl border border-white/[0.1] bg-white/[0.02] p-3 space-y-3">
-                  <div className="flex items-start justify-between gap-2">
-                    <div className="min-w-0">
-                      <div className="text-sm text-white font-semibold truncate">{e.label}</div>
-                      <div className="text-[11px] text-white/55 truncate">{e.symbol} • {timeframe} • {e.marketKey}</div>
-                    </div>
-                    <Badge variant="outline" className={cn('text-[10px]', statusClass)}>{statusLabel}</Badge>
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-2 text-[10px]">
-                    <div className={cn('rounded-md border px-2 py-1.5', e.suggestedSide === 'UP' ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200' : 'border-emerald-500/20 bg-emerald-500/5 text-emerald-200/60')}>
-                      YES / UP
-                    </div>
-                    <div className={cn('rounded-md border px-2 py-1.5 text-right', e.suggestedSide === 'DOWN' ? 'border-rose-500/40 bg-rose-500/15 text-rose-200' : 'border-rose-500/20 bg-rose-500/5 text-rose-200/60')}>
-                      NO / DOWN
-                    </div>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <Badge variant="outline" className="text-[10px] border-violet-500/35 text-violet-200">
-                      Side: {e.suggestedSide}
-                    </Badge>
-                    <Badge variant="outline" className="text-[10px] border-cyan-500/35 text-cyan-200">
-                      {e.confidence}%
-                    </Badge>
-                    <Badge variant="outline" className="text-[10px] border-white/20 text-white/70 max-w-full truncate">
-                      {e.reason}
-                    </Badge>
-                  </div>
-
-                  <div className="grid grid-cols-1 gap-2">
-                    <div className="text-[10px] text-white/55">
-                      Countdown: <span className="text-white/85 font-mono">{formatCountdown(e.countdownSec)}</span>
-                    </div>
-                    <EventSparkline points={decisionSeriesByMarket[e.marketKey]} />
-                  </div>
-
-                  <div className="flex items-center gap-2 pt-1">
-                    <button
-                      type="button"
-                      onClick={() => setConfig({
-                        ...config,
-                        events: config.events.map((x) => x.marketKey === e.marketKey ? { ...x, enabled: !x.enabled } : x),
-                      })}
-                      disabled={isRuntimeStale}
-                      className={cn(
-                        'px-2.5 py-1 rounded-md border text-[11px] transition-colors disabled:opacity-50',
-                        cfg?.enabled
-                          ? 'border-emerald-500/35 bg-emerald-500/15 text-emerald-200'
-                          : 'border-white/20 bg-white/[0.03] text-white/70'
-                      )}
-                    >
-                      {cfg?.enabled ? 'Disable' : 'Enable'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setConfig({
-                        ...config,
-                        events: config.events.filter((x) => x.marketKey !== e.marketKey),
-                      })}
-                      disabled={isRuntimeStale}
-                      className="px-2.5 py-1 rounded-md border border-rose-500/30 bg-rose-500/15 text-rose-200 text-[11px] disabled:opacity-50"
-                    >
-                      Remove
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </CardContent>
-      </Card>
-
-      <Card className="border-white/[0.08]">
-        <CardHeader className="pb-3"><CardTitle className="text-sm text-white/90">Open paper bets</CardTitle></CardHeader>
-        <CardContent>
           <div className="space-y-2 max-h-[260px] overflow-auto pr-1">
             {openBets.map((b) => {
               const timer = getBetTimer(b.settleAt, nowMs);
+              const isLiveBet = b.execution === 'live';
+              const isLongSide = b.side === 'UP';
+              // Determine if bet is currently winning or losing based on live price
+              // Use v4 scanner price, fallback to runtime feed prices (always available)
+              const v4sig = v4Signals.find((s: any) => s.marketKey === b.marketKey);
+              const feedPrice = runtime?.events?.find((e: any) => e.marketKey === b.marketKey);
+              const livePrice = v4sig?.oraclePrice || v4sig?.bybitPrice || (feedPrice as any)?.lastPrice || (() => {
+                // Last resort: extract price from the event reason string
+                const m = (feedPrice?.reason || '').match(/price\s+([\d.]+)/);
+                return m ? parseFloat(m[1]) : null;
+              })();
+              // Use PM odds to determine winning/losing (more reliable than price comparison)
+              const v4market = v4ByKey.get(b.marketKey);
+              const ourSideOdds = v4market?.pmOdds
+                ? (b.side === 'UP' ? v4market.pmOdds.up : v4market.pmOdds.down)
+                : null;
+              const isWinning = ourSideOdds !== null && ourSideOdds !== undefined
+                ? ourSideOdds > 0.50
+                : null;
+              // Calculate unrealized PnL based on current odds vs entry odds
+              const unrealizedPnl = ourSideOdds !== null && ourSideOdds !== undefined
+                ? +(b.sizeUsd * ((ourSideOdds / Math.max(b.entryOdds, 0.05)) - 1)).toFixed(2)
+                : null;
+              const borderClass = isWinning === true
+                ? 'border-emerald-500/40 bg-emerald-500/[0.06]'
+                : isWinning === false
+                  ? 'border-rose-500/40 bg-rose-500/[0.06]'
+                  : isLongSide ? 'border-emerald-500/20 bg-emerald-500/[0.02]' : 'border-rose-500/20 bg-rose-500/[0.02]';
               return (
-                <div key={b.id} className="text-xs rounded-lg border border-white/[0.08] bg-white/[0.02] p-2.5 flex items-center justify-between gap-2">
-                  <div className="min-w-0">
-                    <div className="text-white/70 truncate"><span className="text-white font-medium">{b.pair}</span> • {b.side} • ${b.sizeUsd} • odds {b.entryOdds}</div>
-                    <div className="text-[10px] text-white/45">settle {b.settleAt ? new Date(b.settleAt).toLocaleTimeString() : 'n/a'}</div>
+                <div key={b.id} className={cn("text-xs rounded-lg p-2.5 flex items-center justify-between gap-2", borderClass)}>
+                  <div className="min-w-0 flex items-center gap-2">
+                    <Badge
+                      variant="outline"
+                      className={cn(
+                        'text-[9px] font-semibold shrink-0',
+                        isLiveBet
+                          ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200'
+                          : 'border-cyan-500/30 bg-cyan-500/10 text-cyan-200'
+                      )}
+                    >
+                      {isLiveBet ? 'LIVE' : 'PAPER'}
+                    </Badge>
+                    <div>
+                      <div className="text-white/70 truncate"><span className="text-white font-medium">{b.pair}</span> • {b.side} • ${b.sizeUsd} • odds {b.entryOdds}</div>
+                      <div className="text-[10px] text-white/45">settle {b.settleAt ? new Date(b.settleAt).toLocaleTimeString() : 'n/a'}</div>
+                    </div>
                   </div>
-                  <Badge variant="outline" className={cn('text-[10px] font-mono shrink-0', timer.className)}>
-                    {timer.status === 'COUNTDOWN' ? `T-${timer.label}` : timer.label}
-                  </Badge>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    {unrealizedPnl !== null && (
+                      <span className={cn('text-[10px] font-mono font-semibold', unrealizedPnl >= 0 ? 'text-emerald-400' : 'text-rose-400')}>
+                        {unrealizedPnl >= 0 ? '+' : ''}{unrealizedPnl.toFixed(2)}
+                      </span>
+                    )}
+                    <Badge variant="outline" className={cn('text-[10px] font-mono shrink-0', timer.className)}>
+                      {timer.status === 'COUNTDOWN' ? `T-${timer.label}` : timer.label}
+                    </Badge>
+                  </div>
                 </div>
               );
             })}
-            {openBets.length === 0 && <div className="text-white/40 text-sm">Geen open paper bets.</div>}
+            {openBets.length === 0 && <div className="text-white/40 text-sm">Geen active trades.</div>}
           </div>
         </CardContent>
       </Card>
@@ -877,13 +1044,33 @@ export function PMBotPanel() {
         {!collapsedSections.history && (
           <CardContent>
             <div className="space-y-2 max-h-[320px] overflow-auto pr-1">
-              {history.map((b) => (
-                <div key={b.id} className="text-xs rounded-lg border border-white/[0.08] bg-white/[0.02] p-2.5 flex items-center justify-between gap-2">
-                  <div className="text-white/70"><span className="text-white font-medium">{b.pair}</span> {b.side} • {b.exit} • conf {b.confidence}%</div>
-                  <div className={b.pnlUsd && b.pnlUsd >= 0 ? 'text-emerald-300' : 'text-rose-300'}>${(b.pnlUsd || 0).toFixed(2)}</div>
-                  <div className="text-white/50">{b.settledAt ? new Date(b.settledAt).toLocaleTimeString() : '-'}</div>
-                </div>
-              ))}
+              {history.map((b) => {
+                const isLiveBet = b.execution === 'live';
+                const isWin = (b.exit === 'WIN') || ((b.pnlUsd || 0) > 0);
+                const rowClass = isWin
+                  ? 'border-emerald-500/30 bg-emerald-500/[0.06]'
+                  : 'border-rose-500/30 bg-rose-500/[0.06]';
+                return (
+                  <div key={b.id} className={cn('text-xs rounded-lg border p-2.5 flex items-center justify-between gap-2', rowClass)}>
+                    <div className="flex items-center gap-1.5 text-white/70">
+                      <Badge
+                        variant="outline"
+                        className={cn(
+                          'text-[9px] font-semibold shrink-0',
+                          isLiveBet
+                            ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200'
+                            : 'border-cyan-500/30 bg-cyan-500/10 text-cyan-200'
+                        )}
+                      >
+                        {isLiveBet ? 'LIVE' : 'PAPER'}
+                      </Badge>
+                      <span><span className="text-white font-medium">{b.pair}</span> {b.side} • {b.exit} • conf {b.confidence}%</span>
+                    </div>
+                    <div className={b.pnlUsd && b.pnlUsd >= 0 ? 'text-emerald-300' : 'text-rose-300'}>${(b.pnlUsd || 0).toFixed(2)}</div>
+                    <div className="text-white/50">{b.settledAt ? new Date(b.settledAt).toLocaleTimeString() : '-'}</div>
+                  </div>
+                );
+              })}
               {history.length === 0 && <div className="text-white/40 text-sm">Nog geen gesloten bets.</div>}
             </div>
           </CardContent>
